@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.client;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+import org.eclipse.milo.opcua.sdk.client.nodes.UaVariableNode;
+import org.eclipse.milo.opcua.sdk.core.types.DynamicStructType;
+import org.eclipse.milo.opcua.sdk.test.AbstractClientServerTest;
+import org.eclipse.milo.opcua.sdk.test.MatrixTestType;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DataValue;
+import org.eclipse.milo.opcua.stack.core.types.builtin.ExtensionObject;
+import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DynamicMatrixTestTypeTest extends AbstractClientServerTest {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(DynamicMatrixTestTypeTest.class);
+
+  @Test
+  public void read() throws UaException {
+    AddressSpace addressSpace = client.getAddressSpace();
+
+    UaVariableNode testNode =
+        (UaVariableNode) addressSpace.getNode(new NodeId(2, "MatrixTestTypeValue"));
+
+    DataValue value = testNode.readValue();
+    assertNotNull(value);
+
+    ExtensionObject xo = (ExtensionObject) value.value().value();
+    assert xo != null;
+
+    DynamicStructType decoded = (DynamicStructType) xo.decode(client.getDynamicEncodingContext());
+    assertEquals(
+        MatrixTestType.TYPE_ID,
+        decoded.getTypeId().absolute(client.getNamespaceTable()).orElseThrow());
+    LOGGER.debug("{}", decoded);
+  }
+}

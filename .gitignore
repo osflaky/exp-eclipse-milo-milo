@@ -1,0 +1,39 @@
+*.class
+
+# Package Files #
+*.jar
+*.war
+*.ear
+
+# Eclipse
+.settings/
+.project
+.classpath
+.checkstyle
+
+# IntelliJ #
+*.iml
+.idea/*
+
+# Maven #
+target/
+dependency-reduced-pom.xml
+
+# TestNG #
+test-output/
+
+# macOS .DS_Store
+.DS_Store
+**/.DS_Store
+
+# ".local" folder
+.local/
+
+# Local Claude Code memory
+CLAUDE.local.md
+
+# External src and other files
+external/
+
+# Claude project MCP configuration
+.mcp.json

@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) 2024 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.test;
+
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.Key;
+import java.security.KeyPair;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.UUID;
+import java.util.regex.Pattern;
+import org.eclipse.milo.opcua.sdk.server.util.HostnameUtil;
+import org.eclipse.milo.opcua.stack.core.util.SelfSignedCertificateBuilder;
+import org.eclipse.milo.opcua.stack.core.util.SelfSignedCertificateGenerator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+class KeyStoreLoader {
+
+  private static final Pattern IP_ADDR_PATTERN =
+      Pattern.compile("^(([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\.){3}([01]?\\d\\d?|2[0-4]\\d|25[0-5])$");
+
+  private static final String SERVER_ALIAS = "server-ai";
+  private static final char[] PASSWORD = "password".toCharArray();
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(KeyStoreLoader.class);
+
+  private X509Certificate[] serverCertificateChain;
+  private X509Certificate serverCertificate;
+  private KeyPair serverKeyPair;
+
+  KeyStoreLoader load(File baseDir) throws Exception {
+    KeyStore keyStore = KeyStore.getInstance("PKCS12");
+
+    Path serverKeyStore = baseDir.toPath().resolve("example-server.pfx");
+
+    LOGGER.debug("Loading KeyStore at {}", serverKeyStore);
+
+    if (!Files.exists(serverKeyStore)) {
+      keyStore.load(null, PASSWORD);
+
+      KeyPair keyPair = SelfSignedCertificateGenerator.generateRsaKeyPair(2048);
+
+      String applicationUri = "urn:eclipse:milo:examples:server:" + UUID.randomUUID();
+
+      SelfSignedCertificateBuilder builder =
+          new SelfSignedCertificateBuilder(keyPair)
+              .setCommonName("Eclipse Milo Example Server")
+              .setOrganization("digitalpetri")
+              .setOrganizationalUnit("dev")
+              .setLocalityName("Folsom")
+              .setStateName("CA")
+              .setCountryCode("US")
+              .setApplicationUri(applicationUri);
+
+      // Get as many hostnames and IP addresses as we can to list in the certificate.
+      var hostnames = new HashSet<String>();
+      hostnames.add(HostnameUtil.getHostname());
+      hostnames.addAll(HostnameUtil.getHostnames("0.0.0.0", false));
+
+      for (String hostname : hostnames) {
+        if (IP_ADDR_PATTERN.matcher(hostname).matches()) {
+          builder.addIpAddress(hostname);
+        } else {
+          builder.addDnsName(hostname);
+        }
+      }
+
+      X509Certificate certificate = builder.build();
+
+      keyStore.setKeyEntry(
+          SERVER_ALIAS, keyPair.getPrivate(), PASSWORD, new X509Certificate[] {certificate});
+      try (OutputStream out = Files.newOutputStream(serverKeyStore)) {
+        keyStore.store(out, PASSWORD);
+      }
+    } else {
+      try (InputStream in = Files.newInputStream(serverKeyStore)) {
+        keyStore.load(in, PASSWORD);
+      }
+    }
+
+    Key serverPrivateKey = keyStore.getKey(SERVER_ALIAS, PASSWORD);
+    if (serverPrivateKey instanceof PrivateKey) {
+      serverCertificate = (X509Certificate) keyStore.getCertificate(SERVER_ALIAS);
+
+      serverCertificateChain =
+          Arrays.stream(keyStore.getCertificateChain(SERVER_ALIAS))
+              .map(X509Certificate.class::cast)
+              .toArray(X509Certificate[]::new);
+
+      PublicKey serverPublicKey = serverCertificate.getPublicKey();
+      serverKeyPair = new KeyPair(serverPublicKey, (PrivateKey) serverPrivateKey);
+    }
+
+    return this;
+  }
+
+  X509Certificate getServerCertificate() {
+    return serverCertificate;
+  }
+
+  public X509Certificate[] getServerCertificateChain() {
+    return serverCertificateChain;
+  }
+
+  KeyPair getServerKeyPair() {
+    return serverKeyPair;
+  }
+}

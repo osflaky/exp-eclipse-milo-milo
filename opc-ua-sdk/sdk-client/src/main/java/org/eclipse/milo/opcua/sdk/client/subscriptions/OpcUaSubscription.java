@@ -1,0 +1,2933 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.client.subscriptions;
+
+import static java.util.Objects.requireNonNull;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+
+import com.google.common.primitives.Ints;
+import com.google.common.util.concurrent.MoreExecutors;
+import java.math.BigInteger;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.eclipse.milo.opcua.sdk.client.OpcUaClient;
+import org.eclipse.milo.opcua.sdk.client.SessionActivityListener;
+import org.eclipse.milo.opcua.sdk.client.UaSession;
+import org.eclipse.milo.opcua.stack.core.StatusCodes;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.UaRuntimeException;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DataValue;
+import org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode;
+import org.eclipse.milo.opcua.stack.core.types.builtin.Variant;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UByte;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.MonitoringMode;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.TimestampsToReturn;
+import org.eclipse.milo.opcua.stack.core.types.structured.CreateMonitoredItemsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.CreateSubscriptionResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.DeleteMonitoredItemsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.DeleteSubscriptionsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.EventFieldList;
+import org.eclipse.milo.opcua.stack.core.types.structured.ModifyMonitoredItemsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.ModifySubscriptionResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemCreateRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemCreateResult;
+import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemModifyRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemModifyResult;
+import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemNotification;
+import org.eclipse.milo.opcua.stack.core.types.structured.SetMonitoringModeResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.SetPublishingModeResponse;
+import org.eclipse.milo.opcua.stack.core.util.NonBlockingLazy;
+import org.eclipse.milo.opcua.stack.core.util.TaskQueue;
+import org.eclipse.milo.opcua.stack.core.util.Unit;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A Subscription on a Server, and the client-side object that represents it.
+ *
+ * <p>The two are not the same thing and do not have the same lifetime. A Subscription exists on the
+ * Server from {@link #create()} until it is deleted, times out, or {@link #reset()} discards the
+ * client's knowledge of it; this object exists for as long as the application holds it, and may
+ * represent several Subscriptions in sequence.
+ *
+ * <p><b>Threading:</b> the lifecycle transitions that call a service — {@link #create()}, {@link
+ * #modify()}, {@link #delete()} and {@link #setPublishingMode(boolean)} — are each a check of the
+ * current state, a service call, and an update of that state. Each is implemented once, as its
+ * {@code ...Async()} form composed from the client's asynchronous services; the blocking form is
+ * that stage awaited, so the two cannot disagree about the state they leave behind. No transition
+ * ever occupies a thread while it waits for the Server, including one waiting its turn, which is
+ * what makes the asynchronous forms safe to call from any thread — above all from the transport
+ * executor, whose threads are the ones that complete the responses they are waiting for. A blocking
+ * form, like any blocking call, must be made from a thread that is not one of those.
+ *
+ * <p>Transitions are serialized against each other: one runs to completion before the next begins,
+ * and a second concurrent {@link #create()} is answered {@code Bad_InvalidState} rather than
+ * creating a second Subscription on the Server that no client object could then name or delete.
+ *
+ * <p>{@link #reset()} is <i>not</i> one of them. It only discards what the client knows, sends
+ * nothing, and never waits for a transition that is waiting for the Server — because it is called
+ * from places that must not be stopped for a network round trip: the Bad_Timeout
+ * StatusChangeNotification path runs on this Subscription's delivery queue, and {@link
+ * #notifyTransferFailed(StatusCode)} runs on the Session's state machine. A {@link #reset()} that
+ * overtakes a transition already in flight wins: the transition's result is discarded when it
+ * arrives rather than applied to a Subscription this object no longer represents.
+ *
+ * <p>The accessors read individual volatile fields and are not serialized against any of this. The
+ * parameter setters take the lifecycle lock for their check-then-act on the pending modifications —
+ * a setter racing a {@link #reset()} must not re-mark a discarded Subscription unsynchronized — but
+ * the lock is never held across a service call, so they still never block on one. MonitoredItem
+ * management is not serialized either: it is concurrent with the lifecycle only in the sense that
+ * it reports {@code Bad_InvalidState} when the Subscription is gone.
+ */
+public class OpcUaSubscription {
+
+  private static final int DEFAULT_MAX_MONITORED_ITEMS_PER_CALL = 10000;
+  private static final UInteger DEFAULT_MAX_NOTIFICATIONS_PER_PUBLISH = uint(65535);
+  private static final UByte DEFAULT_PRIORITY = ubyte(0);
+  private static final double DEFAULT_PUBLISHING_INTERVAL = 1000.0;
+  private static final double DEFAULT_TARGET_KEEP_ALIVE_INTERVAL = 10000.0;
+
+  private final Logger logger = LoggerFactory.getLogger(getClass());
+
+  /**
+   * Guards the lifecycle state — {@link #syncState}, {@link #serverState}, {@link #modifications},
+   * {@link #transitionInFlight}, {@link #transitionWaiters} and {@link #incarnation} — and
+   * serializes the lifecycle transitions, each of which is a check-then-act around a service call:
+   * without that, two of them interleave and the Server ends up in a state no single client-side
+   * field describes — most visibly a second Subscription created by a concurrent {@link #create()}
+   * whose SubscriptionId is immediately overwritten, leaving it running on the Server with nothing
+   * left that can name it.
+   *
+   * <p><b>Never held across a service call.</b> A transition claims {@link #transitionInFlight},
+   * releases this lock, makes the call, then takes the lock again to apply the result. Holding it
+   * for the round trip would make every other user of the lock — above all {@link #reset()}, which
+   * is called from the delivery queue and from the Session's state machine — wait out someone
+   * else's request timeout, and on a bounded transport executor it deadlocks: the thread that would
+   * complete the response is one of the threads blocked on the lock.
+   *
+   * <p>Nothing waits on this monitor either, for the same reason: a transition that has to wait for
+   * the one ahead of it is queued in {@link #transitionWaiters} instead.
+   *
+   * <p>The accessors do not take it. The parameter setters take it only for their short
+   * check-then-act on {@link #modifications} and {@link #syncState}; nothing they do under it can
+   * block.
+   */
+  private final Object lifecycleLock = new Object();
+
+  /**
+   * {@code true} while a lifecycle transition holds the right to change the lifecycle state, i.e.
+   * from the moment it is started until the {@link CompletionStage} it returned has completed.
+   * Guarded by {@link #lifecycleLock}.
+   *
+   * <p>Deliberately not a {@link SyncState}: that enum is public API and describes what the client
+   * knows about the Subscription, not what it is currently asking the Server for. {@link
+   * #getSyncState()} therefore keeps reporting the state the Subscription had when the in-flight
+   * call was made, which is exactly what is still true of it until the Server answers.
+   */
+  private boolean transitionInFlight = false;
+
+  /**
+   * Lifecycle transitions that arrived while another one held {@link #transitionInFlight}, in the
+   * order they arrived. Each is started by completing its {@link CompletableFuture}, which {@link
+   * #endTransition()} does when the transition ahead of it finishes.
+   *
+   * <p>A queue rather than a wait on {@link #lifecycleLock}: waiting by blocking would tie up a
+   * thread per queued transition, and the one thread an asynchronous call might be made from — a
+   * transport executor thread — is the thread the in-flight transition needs to be answered on.
+   *
+   * <p>Guarded by {@link #lifecycleLock}.
+   */
+  private final Deque<CompletableFuture<Unit>> transitionWaiters = new ArrayDeque<>();
+
+  /**
+   * Identifies the Subscription this object currently represents. Incremented by every {@link
+   * #reset()}, i.e. whenever this object stops representing the Subscription it did.
+   *
+   * <p>A transition captures it while claiming {@link #transitionInFlight} and compares it again
+   * when the response arrives: a change means a {@link #reset()} discarded the Subscription the
+   * call was made for, so the result must not be applied to whatever this object holds now. For
+   * {@link #create()} it also means the Subscription the Server just created belongs to nobody, and
+   * has to be deleted rather than left running.
+   *
+   * <p>Guarded by {@link #lifecycleLock}.
+   */
+  private long incarnation = 0L;
+
+  private volatile SyncState syncState = SyncState.INITIAL;
+  private volatile @Nullable ServerState serverState;
+  private volatile Modifications modifications;
+
+  private volatile WatchdogTimer watchdogTimer;
+
+  /**
+   * Marks the executor callback dispatched by {@link #handleTransferFailure(StatusCode)} after its
+   * non-overridable cleanup has already run. The public callback remains overridable for
+   * compatibility, but the base implementation must not reset a second time and invalidate a new
+   * incarnation created before the asynchronous notification runs.
+   */
+  private final ThreadLocal<Boolean> transferFailureAlreadyHandled = new ThreadLocal<>();
+
+  /**
+   * Guards changes that move a MonitoredItem between {@link #monitoredItems} and {@link
+   * #itemsToDelete}, including applying a DeleteMonitoredItems result that detaches the item.
+   *
+   * <p>The collections remain concurrent because notification delivery and the synchronization
+   * queries read them without this lock. The lock makes the multi-step bookkeeping atomic: in
+   * particular, adding an item back while its deletion is in flight must be ordered against the
+   * response that clears its ClientHandle.
+   */
+  private final Object monitoredItemsLock = new Object();
+
+  /** MonitoredItems added to this Subscription, by ClientHandle. */
+  private final Map<UInteger, OpcUaMonitoredItem> monitoredItems = new ConcurrentHashMap<>();
+
+  /**
+   * MonitoredItems that have been removed from the Subscription and are pending deletion on the
+   * Server.
+   */
+  private final Set<OpcUaMonitoredItem> itemsToDelete =
+      Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+  private final ClientHandleSequence clientHandleSequence =
+      new ClientHandleSequence(monitoredItems::containsKey);
+
+  private volatile Double publishingInterval = DEFAULT_PUBLISHING_INTERVAL;
+  private volatile UInteger maxKeepAliveCount =
+      calculateMaxKeepAliveCount(publishingInterval, DEFAULT_TARGET_KEEP_ALIVE_INTERVAL);
+  private volatile UInteger lifetimeCount = calculateLifetimeCount(maxKeepAliveCount);
+  private volatile UInteger maxNotificationsPerPublish = DEFAULT_MAX_NOTIFICATIONS_PER_PUBLISH;
+  private volatile UByte priority = DEFAULT_PRIORITY;
+
+  private volatile boolean lifetimeAndKeepAliveCalculated = true;
+  private volatile double watchdogMultiplier = 1.5;
+
+  private volatile UInteger maxMonitoredItemsPerCall = uint(DEFAULT_MAX_MONITORED_ITEMS_PER_CALL);
+  private final NonBlockingLazy<UInteger> monitoredItemPartitionSize = new NonBlockingLazy<>();
+  private volatile long monitoredItemPartitionGeneration;
+
+  private volatile @Nullable Object userObject;
+
+  private volatile @Nullable SubscriptionListener listener;
+
+  private final TaskQueue deliveryQueue;
+  private final Executor transitionHandoffExecutor;
+
+  private final OpcUaClient client;
+
+  public OpcUaSubscription(OpcUaClient client) {
+    this.client = client;
+
+    Executor executor = client.getTransport().getConfig().getExecutor();
+    deliveryQueue = new TaskQueue(executor);
+    transitionHandoffExecutor =
+        MoreExecutors.newSequentialExecutor(
+            command -> {
+              try {
+                executor.execute(command);
+              } catch (RejectedExecutionException e) {
+                // Finishing a transition must release its successor even when the executor shuts
+                // down.
+                command.run();
+              }
+            });
+  }
+
+  /**
+   * Create a Subscription with the given PublishingInterval.
+   *
+   * <p>The MaxKeepAliveCount and LifetimeCount are derived from {@code publishingInterval}, as they
+   * would be by {@link #setPublishingInterval(Double)}.
+   *
+   * @param client the {@link OpcUaClient} this Subscription belongs to.
+   * @param publishingInterval the PublishingInterval to request.
+   */
+  public OpcUaSubscription(OpcUaClient client, double publishingInterval) {
+    this(client);
+
+    // Delegate to the setter so the MaxKeepAliveCount and LifetimeCount are derived from
+    // this PublishingInterval instead of being left at their default-derived values.
+    setPublishingInterval(publishingInterval);
+  }
+
+  /**
+   * Get the client this Subscription belongs to.
+   *
+   * @return the {@link OpcUaClient} this Subscription belongs to.
+   */
+  public OpcUaClient getClient() {
+    return client;
+  }
+
+  // region Subscription Management
+
+  /**
+   * Create this Subscription on the Server.
+   *
+   * <p>Serialized against the other lifecycle transitions; see the class documentation. A call made
+   * while this Subscription already exists on the Server, including one made concurrently with the
+   * call that created it, fails with {@code Bad_InvalidState}.
+   *
+   * <p>A {@link #reset()} made while this call is waiting for the Server also fails it with {@code
+   * Bad_InvalidState}: the reset has discarded the Subscription being created, so the Subscription
+   * the Server did create is deleted again rather than installed.
+   *
+   * <p>Blocks until the Server has answered; this is {@link #createAsync()} awaited, so it must not
+   * be called from a transport executor thread. See the class documentation.
+   *
+   * @throws UaException if a service- or operation-level error occurs.
+   */
+  public void create() throws UaException {
+    await(createAsync());
+  }
+
+  /**
+   * Create this Subscription on the Server.
+   *
+   * <p>Fails with {@code Bad_InvalidState} under exactly the conditions {@link #create()} throws
+   * it: the Subscription already exists, or a {@link #reset()} superseded the call.
+   *
+   * @return a {@link CompletionStage} that completes successfully if the Subscription was created,
+   *     or completes exceptionally if there was a service- or operation-level error.
+   */
+  public CompletionStage<Unit> createAsync() {
+    return runTransition(this::createTransition);
+  }
+
+  /**
+   * Call the CreateSubscription service and install the Subscription the Server creates.
+   *
+   * <p>Runs with the transition slot claimed; see {@link #runTransition(Supplier)}.
+   *
+   * @return a {@link CompletionStage} that completes when the Subscription has been created, or
+   *     completes exceptionally if it has not been.
+   */
+  private CompletionStage<Unit> createTransition() {
+    long incarnation;
+
+    synchronized (lifecycleLock) {
+      if (syncState != SyncState.INITIAL) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      }
+
+      if (maxKeepAliveCount == null) {
+        maxKeepAliveCount =
+            calculateMaxKeepAliveCount(publishingInterval, DEFAULT_TARGET_KEEP_ALIVE_INTERVAL);
+      }
+      if (lifetimeCount == null) {
+        lifetimeCount = calculateLifetimeCount(maxKeepAliveCount);
+      }
+
+      incarnation = this.incarnation;
+    }
+
+    return client
+        .createSubscriptionAsync(
+            publishingInterval,
+            lifetimeCount,
+            maxKeepAliveCount,
+            maxNotificationsPerPublish,
+            true,
+            priority)
+        .thenCompose(response -> applyCreateResponse(response, incarnation));
+  }
+
+  /**
+   * Install the Subscription the Server created, unless a {@link #reset()} has meanwhile discarded
+   * it.
+   *
+   * @param response the {@link CreateSubscriptionResponse} the Server returned.
+   * @param incarnation the {@link #incarnation} the call was made for.
+   * @return a {@link CompletionStage} that completes when the response has been dealt with, or
+   *     completes exceptionally with {@code Bad_InvalidState} if the Subscription it describes has
+   *     been superseded.
+   */
+  private CompletionStage<Unit> applyCreateResponse(
+      CreateSubscriptionResponse response, long incarnation) {
+
+    synchronized (lifecycleLock) {
+      if (this.incarnation == incarnation) {
+        // Before the SyncState says the Subscription exists: a SYNCHRONIZED Subscription with no
+        // ServerState has no SubscriptionId to offer, and every operation that needs one answers
+        // Bad_InvalidState until it appears.
+        serverState =
+            new ServerState(
+                response.getSubscriptionId(),
+                response.getRevisedPublishingInterval(),
+                response.getRevisedLifetimeCount(),
+                response.getRevisedMaxKeepAliveCount(),
+                maxNotificationsPerPublish,
+                priority,
+                true);
+
+        syncState = SyncState.SYNCHRONIZED;
+
+        watchdogTimer = new WatchdogTimer();
+        client.addSessionActivityListener(watchdogTimer);
+
+        // Registered while the lock is still held, so the SubscriptionId the PublishingManager
+        // binds its entry to is the one installed above and not one a reset() has since cleared.
+        client.addSubscription(this);
+        client.getPublishingManager().addSubscription(this);
+
+        // Register before checking the suspension gate. If reconnect recovery resumes between
+        // these operations, either its registry sweep sees this Subscription or this check sees
+        // publishing allowed; there is no interval in which both can miss it.
+        resetWatchdogTimer();
+
+        return CompletableFuture.completedFuture(Unit.VALUE);
+      }
+    }
+
+    // A reset() overtook this call, so the Subscription the Server has just created is one this
+    // object has already been told to forget. Deleted out here rather than above: nothing that
+    // sends a request belongs in that critical section.
+    deleteAbandonedSubscription(response.getSubscriptionId());
+
+    return CompletableFuture.failedFuture(
+        new UaException(
+            StatusCodes.Bad_InvalidState, "the Subscription was reset while it was being created"));
+  }
+
+  /**
+   * Call the ModifySubscription service to update the Subscription's parameters on the Server.
+   *
+   * <p>Serialized against the other lifecycle transitions; see the class documentation. A {@link
+   * #reset()} made while this call is waiting for the Server supersedes it: the revised parameters
+   * describe a Subscription this object no longer represents, so they are discarded and the call
+   * fails with {@code Bad_InvalidState}.
+   *
+   * <p>Blocks until the Server has answered; this is {@link #modifyAsync()} awaited, so it must not
+   * be called from a transport executor thread. See the class documentation.
+   *
+   * @throws UaException if a service- or operation-level error occurs.
+   */
+  public void modify() throws UaException {
+    await(modifyAsync());
+  }
+
+  /**
+   * Call the ModifySubscription service to update the Subscription's parameters on the Server.
+   *
+   * <p>Completes successfully without calling the service if there is nothing pending to send,
+   * exactly as {@link #modify()} returns without calling it.
+   *
+   * @return a {@link CompletionStage} that completes successfully if the Subscription was modified,
+   *     or completes exceptionally if there was a service- or operation-level error.
+   */
+  public CompletionStage<Unit> modifyAsync() {
+    return runTransition(this::modifyTransition);
+  }
+
+  /**
+   * Call the ModifySubscription service with the pending {@link Modifications} and install the
+   * parameters the Server revises them to.
+   *
+   * <p>Runs with the transition slot claimed; see {@link #runTransition(Supplier)}.
+   *
+   * @return a {@link CompletionStage} that completes when the Subscription has been modified, or
+   *     completes exceptionally if it has not been.
+   */
+  private CompletionStage<Unit> modifyTransition() {
+    long incarnation;
+    ServerState serverState;
+    Modifications diff;
+
+    synchronized (lifecycleLock) {
+      if (syncState == SyncState.INITIAL) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      } else if (syncState != SyncState.UNSYNCHRONIZED) {
+        return CompletableFuture.completedFuture(Unit.VALUE);
+      }
+
+      serverState = this.serverState;
+      if (serverState == null) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      }
+
+      diff = modifications;
+      modifications = null;
+
+      assert diff != null;
+
+      incarnation = this.incarnation;
+    }
+
+    ServerState previousState = serverState;
+    Modifications sentDiff = diff;
+
+    return client
+        .modifySubscriptionAsync(
+            serverState.getSubscriptionId(),
+            diff.publishingInterval().orElse(serverState.getPublishingInterval()),
+            diff.lifetimeCount().orElse(serverState.getLifetimeCount()),
+            diff.maxKeepAliveCount().orElse(serverState.getMaxKeepAliveCount()),
+            diff.maxNotificationsPerPublish().orElse(maxNotificationsPerPublish),
+            diff.priority().orElse(priority))
+        .whenComplete(
+            (response, ex) -> {
+              if (ex != null) {
+                synchronized (lifecycleLock) {
+                  if (this.incarnation == incarnation) {
+                    // The service call failed, so the Subscription remains UNSYNCHRONIZED. Restore
+                    // the pending modifications so the next modify() retries them instead of
+                    // finding nothing to send. Not restored if a reset() overtook the call: it
+                    // cleared them on purpose, and they describe a Subscription that no longer
+                    // exists.
+                    restorePendingModifications(sentDiff);
+                  }
+                }
+              }
+            })
+        .thenCompose(response -> applyModifyResponse(response, previousState, incarnation));
+  }
+
+  /**
+   * Install the parameters the Server revised, unless a {@link #reset()} has meanwhile discarded
+   * the Subscription they belong to.
+   *
+   * @param response the {@link ModifySubscriptionResponse} the Server returned.
+   * @param previousState the {@link ServerState} the call was made against.
+   * @param incarnation the {@link #incarnation} the call was made for.
+   * @return a {@link CompletionStage} that completes when the response has been dealt with, or
+   *     completes exceptionally with {@code Bad_InvalidState} if the Subscription it describes has
+   *     been superseded.
+   */
+  private CompletionStage<Unit> applyModifyResponse(
+      ModifySubscriptionResponse response, ServerState previousState, long incarnation) {
+
+    synchronized (lifecycleLock) {
+      if (this.incarnation != incarnation) {
+        return CompletableFuture.failedFuture(
+            new UaException(
+                StatusCodes.Bad_InvalidState,
+                "the Subscription was reset while it was being modified"));
+      }
+
+      this.serverState =
+          new ServerState(
+              previousState.getSubscriptionId(),
+              response.getRevisedPublishingInterval(),
+              response.getRevisedLifetimeCount(),
+              response.getRevisedMaxKeepAliveCount(),
+              maxNotificationsPerPublish,
+              priority,
+              previousState.isPublishingEnabled());
+
+      // Must happen after the revised parameters are installed: the watchdog delay is
+      // derived from the current ServerState, so re-arming any earlier would use the
+      // pre-modify PublishingInterval and MaxKeepAliveCount.
+      resetWatchdogTimer();
+
+      if (modifications == null) {
+        syncState = SyncState.SYNCHRONIZED;
+      }
+
+      return CompletableFuture.completedFuture(Unit.VALUE);
+    }
+  }
+
+  /**
+   * Restore {@code diff} as the pending {@link Modifications} after a failed modify service call,
+   * so that a subsequent {@link #modify()} retries the same parameters.
+   *
+   * <p>Any Modifications requested while the failed service call was in flight take precedence over
+   * the values being restored.
+   *
+   * @param diff the {@link Modifications} the failed service call attempted to apply.
+   */
+  private void restorePendingModifications(Modifications diff) {
+    Modifications pending = modifications;
+
+    if (pending == null) {
+      modifications = diff;
+    } else {
+      if (pending.publishingInterval == null) {
+        pending.publishingInterval = diff.publishingInterval;
+      }
+      if (pending.lifetimeCount == null) {
+        pending.lifetimeCount = diff.lifetimeCount;
+      }
+      if (pending.maxKeepAliveCount == null) {
+        pending.maxKeepAliveCount = diff.maxKeepAliveCount;
+      }
+      if (pending.maxNotificationsPerPublish == null) {
+        pending.maxNotificationsPerPublish = diff.maxNotificationsPerPublish;
+      }
+      if (pending.priority == null) {
+        pending.priority = diff.priority;
+      }
+    }
+  }
+
+  /**
+   * Delete this Subscription from the Server.
+   *
+   * <p>Serialized against the other lifecycle transitions; see the class documentation. A {@link
+   * #reset()} made while this call is waiting for the Server has already discarded the Subscription
+   * by the time the response arrives, so this call does not reset it a second time; the
+   * operation-level result of the DeleteSubscriptions call is reported either way.
+   *
+   * <p>Blocks until the Server has answered; this is {@link #deleteAsync()} awaited, so it must not
+   * be called from a transport executor thread. See the class documentation.
+   *
+   * @throws UaException if a service- or operation-level error occurs.
+   */
+  public void delete() throws UaException {
+    await(deleteAsync());
+  }
+
+  /**
+   * Delete this Subscription from the Server.
+   *
+   * <p>Completes successfully without calling the service if this Subscription does not exist on
+   * the Server, exactly as {@link #delete()} returns without calling it.
+   *
+   * @return a {@link CompletionStage} that completes successfully if the Subscription was deleted,
+   *     or completes exceptionally if there was a service- or operation-level error.
+   */
+  public CompletionStage<Unit> deleteAsync() {
+    return runTransition(this::deleteTransition);
+  }
+
+  /**
+   * Call the DeleteSubscriptions service and discard the Subscription it deleted.
+   *
+   * <p>Runs with the transition slot claimed; see {@link #runTransition(Supplier)}.
+   *
+   * @return a {@link CompletionStage} that completes when the Subscription has been deleted, or
+   *     completes exceptionally if it has not been.
+   */
+  private CompletionStage<Unit> deleteTransition() {
+    long incarnation;
+    ServerState serverState;
+
+    synchronized (lifecycleLock) {
+      if (syncState == SyncState.INITIAL) {
+        return CompletableFuture.completedFuture(Unit.VALUE);
+      }
+
+      serverState = this.serverState;
+      if (serverState == null) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      }
+
+      incarnation = this.incarnation;
+    }
+
+    return client
+        .deleteSubscriptionsAsync(List.of(serverState.getSubscriptionId()))
+        .thenCompose(response -> applyDeleteResponse(response, incarnation));
+  }
+
+  /**
+   * Discard the Subscription the Server deleted, unless a {@link #reset()} has meanwhile discarded
+   * it already.
+   *
+   * @param response the {@link DeleteSubscriptionsResponse} the Server returned.
+   * @param incarnation the {@link #incarnation} the call was made for.
+   * @return a {@link CompletionStage} that completes when the response has been dealt with, or
+   *     completes exceptionally with the operation-level result if it was not Good.
+   */
+  private CompletionStage<Unit> applyDeleteResponse(
+      DeleteSubscriptionsResponse response, long incarnation) {
+
+    StatusCode result = requireNonNull(response.getResults())[0];
+
+    synchronized (lifecycleLock) {
+      // A reset() that overtook this call has already discarded the Subscription, so there is
+      // nothing left for this one to discard.
+      if (this.incarnation == incarnation
+          && (result.isGood() || result.value() == StatusCodes.Bad_SubscriptionIdInvalid)) {
+        reset();
+      }
+    }
+
+    return result.isGood()
+        ? CompletableFuture.completedFuture(Unit.VALUE)
+        : CompletableFuture.failedFuture(new UaException(result));
+  }
+
+  /**
+   * Run a lifecycle transition as soon as no other one is in flight.
+   *
+   * <p>Nothing here blocks, and neither does anything it runs: a transition that has to wait its
+   * turn is queued in {@link #transitionWaiters} and started by whichever thread releases the slot.
+   * That is what lets the {@code ...Async()} forms be composed from the client's asynchronous
+   * services and awaited by the blocking ones, instead of each blocking form being dispatched onto
+   * the transport executor to wait there for a response only that executor can complete.
+   *
+   * @param transition the transition to run. It is called with the transition slot claimed and
+   *     {@link #lifecycleLock} not held, must not block, and must report failure through the {@link
+   *     CompletionStage} it returns.
+   * @return a {@link CompletionStage} that completes when {@code transition} has, with whatever
+   *     {@code transition} completed with.
+   */
+  private CompletionStage<Unit> runTransition(Supplier<CompletionStage<Unit>> transition) {
+    // Completed to hand the transition slot to this transition: below if nothing else holds it, or
+    // by endTransition() once the transition ahead of it is finished.
+    var slot = new CompletableFuture<Unit>();
+
+    boolean claimed;
+
+    synchronized (lifecycleLock) {
+      claimed = !transitionInFlight;
+
+      if (claimed) {
+        transitionInFlight = true;
+      } else {
+        transitionWaiters.add(slot);
+      }
+    }
+
+    CompletionStage<Unit> internalResult =
+        slot.thenCompose(unit -> transition.get()).whenComplete((unit, ex) -> endTransition());
+
+    // Callers are allowed to cancel or time out the stage they receive, but that must not cancel
+    // the dependent stage above: it owns the transition slot until the actual service operation
+    // has completed and endTransition() has handed the slot on. This extra dependent preserves the
+    // caller-visible result while isolating the internal cleanup from external completion.
+    CompletionStage<Unit> callerResult = internalResult.thenApply(unit -> unit);
+
+    // After the chain above is built, so that a slot already in hand starts the transition here
+    // rather than leaving it to whoever completes the stage next.
+    if (claimed) {
+      slot.complete(Unit.VALUE);
+    }
+
+    return callerResult;
+  }
+
+  /**
+   * Release the transition slot claimed by {@link #runTransition(Supplier)}, handing it straight to
+   * the transition that has been waiting longest if there is one.
+   *
+   * <p>Called however a transition ends, so that the next one is not left waiting on a slot nobody
+   * holds. Handed over rather than released and re-claimed: a slot that was briefly free would let
+   * a transition that arrives now overtake one that has been waiting.
+   */
+  private void endTransition() {
+    CompletableFuture<Unit> next;
+
+    synchronized (lifecycleLock) {
+      next = transitionWaiters.poll();
+
+      if (next == null) {
+        transitionInFlight = false;
+      }
+    }
+
+    if (next != null) {
+      // The sequential executor trampolines direct execution and rejected handoffs. A long queue
+      // of synchronous transitions cannot recurse, and no completion runs under lifecycleLock.
+      transitionHandoffExecutor.execute(() -> next.complete(Unit.VALUE));
+    }
+  }
+
+  /**
+   * Await a lifecycle transition, so that a blocking transition is its asynchronous counterpart and
+   * nothing more.
+   *
+   * @param stage the {@link CompletionStage} the asynchronous transition returned.
+   * @throws UaException if {@code stage} completed exceptionally, or the calling thread was
+   *     interrupted while waiting for it.
+   */
+  private static void await(CompletionStage<Unit> stage) throws UaException {
+    try {
+      stage.toCompletableFuture().get();
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+
+      // Rethrown rather than wrapped when it is already a UaException: the blocking and the
+      // asynchronous form of a transition must report the same StatusCode and the same message.
+      if (cause instanceof UaException uaException) {
+        throw uaException;
+      } else {
+        throw new UaException(cause);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new UaException(StatusCodes.Bad_UnexpectedError, e);
+    }
+  }
+
+  /**
+   * Delete a Subscription the Server created for this object but which a {@link #reset()} means it
+   * can no longer represent.
+   *
+   * <p>Best effort and never awaited: the caller's result has already been discarded, and the
+   * reason the reset was allowed to overtake it in the first place is that its own callers cannot
+   * afford to wait for the Server. Part 4 §5.13.8 gives DeleteSubscriptions the SubscriptionId as
+   * its only handle on a Subscription, so this is the last chance anything has to name this one; if
+   * the attempt fails it runs on the Server until its lifetime expires, which is worth a warning
+   * and nothing more.
+   *
+   * @param subscriptionId the SubscriptionId of the Subscription to delete.
+   */
+  private void deleteAbandonedSubscription(UInteger subscriptionId) {
+    logger.debug("id={}, deleting Subscription abandoned by a concurrent reset()", subscriptionId);
+
+    client
+        .deleteSubscriptionsAsync(List.of(subscriptionId))
+        .whenComplete(
+            (response, ex) -> {
+              if (ex != null) {
+                logger.warn("id={}, failed to delete abandoned Subscription", subscriptionId, ex);
+              } else {
+                StatusCode result = requireNonNull(response.getResults())[0];
+
+                if (!result.isGood() && result.value() != StatusCodes.Bad_SubscriptionIdInvalid) {
+                  logger.warn(
+                      "id={}, failed to delete abandoned Subscription: {}", subscriptionId, result);
+                }
+              }
+            });
+  }
+
+  // endregion
+
+  // region MonitoredItem Management
+
+  /**
+   * Add a MonitoredItem to this Subscription.
+   *
+   * <p>This item will not be created on the server until {@link #synchronizeMonitoredItems()} is
+   * called.
+   *
+   * @param item the MonitoredItem to add.
+   * @throws UaRuntimeException if the Subscription has not been created yet.
+   */
+  public void addMonitoredItem(OpcUaMonitoredItem item) {
+    synchronized (monitoredItemsLock) {
+      Optional<UInteger> existingHandle = item.getClientHandle();
+
+      if (existingHandle.isPresent()) {
+        UInteger handle = existingHandle.get();
+
+        // O(1) check: if this item is already in the map, nothing to do
+        if (monitoredItems.get(handle) == item) {
+          return;
+        }
+
+        // Item has a handle but isn't in map - check if pending deletion
+        if (itemsToDelete.remove(item)) {
+          monitoredItems.put(handle, item);
+        }
+        // else: item has a handle from a different context, ignore
+      } else {
+        // Brand-new item with no handle
+        UInteger clientHandle = clientHandleSequence.nextClientHandle();
+        item.setClientHandle(clientHandle);
+
+        monitoredItems.put(clientHandle, item);
+      }
+    }
+  }
+
+  /**
+   * Add a group of MonitoredItems to this Subscription.
+   *
+   * <p>These items will not be created on the server until {@link #synchronizeMonitoredItems()} is
+   * called.
+   *
+   * @param items the MonitoredItems to add.
+   * @throws UaRuntimeException if the Subscription has not been created yet.
+   */
+  public void addMonitoredItems(List<OpcUaMonitoredItem> items) {
+    items.forEach(this::addMonitoredItem);
+  }
+
+  /**
+   * Remove a MonitoredItem from this Subscription.
+   *
+   * <p>This item will not be deleted from the server until {@link #synchronizeMonitoredItems()} is
+   * called
+   *
+   * @param item the MonitoredItem to remove.
+   */
+  public void removeMonitoredItem(OpcUaMonitoredItem item) {
+    synchronized (monitoredItemsLock) {
+      item.getClientHandle().map(monitoredItems::remove).ifPresent(itemsToDelete::add);
+    }
+  }
+
+  /**
+   * Remove a group of MonitoredItems from this Subscription.
+   *
+   * <p>These items will not be deleted from the server until {@link #synchronizeMonitoredItems()}
+   * is called.
+   *
+   * @param items the MonitoredItems to remove.
+   * @throws UaRuntimeException if the Subscription has not been created yet.
+   */
+  public void removeMonitoredItems(List<OpcUaMonitoredItem> items) {
+    items.forEach(this::removeMonitoredItem);
+  }
+
+  /**
+   * Synchronize the Subscription's MonitoredItems with the Server.
+   *
+   * <p>This is a compound operation that deletes any MonitoredItems that have been removed from the
+   * Subscription, modifies any existing MonitoredItems that have been changed, and creates any new
+   * MonitoredItems that have been added but not yet created on the Server.
+   *
+   * @throws MonitoredItemSynchronizationException if one or more MonitoredItems failed to
+   *     synchronize for any reason. This could be a service-level failure or an operation-level
+   *     failure. Check the {@link MonitoredItemServiceOperationResult}s for details.
+   */
+  public void synchronizeMonitoredItems() throws MonitoredItemSynchronizationException {
+    List<MonitoredItemServiceOperationResult> deleteResults = deleteMonitoredItems();
+    List<MonitoredItemServiceOperationResult> modifyResults = modifyMonitoredItems();
+    List<MonitoredItemServiceOperationResult> createResults = createMonitoredItems();
+
+    if (Stream.of(deleteResults, modifyResults, createResults)
+        .flatMap(List::stream)
+        .anyMatch(
+            r -> !r.serviceResult().isGood() || !r.operationResult().orElseThrow().isGood())) {
+
+      throw new MonitoredItemSynchronizationException(
+          "failed to synchronize one or more MonitoredItems",
+          createResults,
+          modifyResults,
+          deleteResults);
+    }
+  }
+
+  /**
+   * Create any MonitoredItems that have been added to the Subscription but not yet created on the
+   * Server.
+   *
+   * @return a List of {@link MonitoredItemServiceOperationResult}s that contain the MonitoredItem
+   *     and the service- and operation-level results associated with the attempt to create it.
+   */
+  public List<MonitoredItemServiceOperationResult> createMonitoredItems() {
+    List<OpcUaMonitoredItem> itemsToCreate =
+        monitoredItems.values().stream()
+            .filter(item -> item.getSyncState() == OpcUaMonitoredItem.SyncState.INITIAL)
+            .collect(Collectors.toList());
+
+    return createMonitoredItems(itemsToCreate);
+  }
+
+  /**
+   * Create any MonitoredItems that have been added to the Subscription but not yet created on the
+   * Server, filtered by the given predicate.
+   *
+   * <p>This could be used to e.g. further restrict the MonitoredItems to be created to only those
+   * that have not had a previous creation attempt:
+   *
+   * <pre>
+   *   List<MonitoredItemServiceOperationResult> results = subscription.createMonitoredItems(
+   *      item -> item.getCreateResult().isEmpty()
+   *   );
+   * </pre>
+   *
+   * @param filter a predicate that allows further restriction of the MonitoredItems to be created.
+   * @return a List of {@link MonitoredItemServiceOperationResult}s that contain the MonitoredItem
+   *     and the service- and operation-level results associated with the attempt to create it.
+   */
+  public List<MonitoredItemServiceOperationResult> createMonitoredItems(
+      Predicate<OpcUaMonitoredItem> filter) {
+
+    List<OpcUaMonitoredItem> itemsToCreate =
+        monitoredItems.values().stream()
+            .filter(item -> item.getSyncState() == OpcUaMonitoredItem.SyncState.INITIAL)
+            .filter(filter)
+            .collect(Collectors.toList());
+
+    return createMonitoredItems(itemsToCreate);
+  }
+
+  private List<MonitoredItemServiceOperationResult> createMonitoredItems(
+      List<OpcUaMonitoredItem> itemsToCreate) {
+
+    if (itemsToCreate.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    MonitoredItemOperationContext context = getMonitoredItemOperationContext();
+    if (context == null) {
+      logger.debug("Bad_InvalidState: subscription not created yet");
+
+      var serviceOperationsResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(itemsToCreate.size());
+      for (OpcUaMonitoredItem item : itemsToCreate) {
+        serviceOperationsResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+
+      return serviceOperationsResults;
+    }
+
+    return executeMonitoredItemPartitions(
+        itemsToCreate, context, partition -> createMonitoredItems(context, partition));
+  }
+
+  private MonitoredItemPartitionAttempt createMonitoredItems(
+      MonitoredItemOperationContext context, List<OpcUaMonitoredItem> partition) {
+
+    List<MonitoredItemCreateRequest> itemsToCreate;
+    synchronized (lifecycleLock) {
+      if (incarnation != context.incarnation()) {
+        return invalidStateAttempt(partition, partition.size());
+      }
+
+      itemsToCreate =
+          partition.stream().map(OpcUaMonitoredItem::newCreateRequest).collect(Collectors.toList());
+    }
+
+    try {
+      logger.debug(
+          "id={}, createMonitoredItems partition.size(): {}",
+          context.serverState().getSubscriptionId(),
+          partition.size());
+
+      CreateMonitoredItemsResponse response =
+          client.createMonitoredItems(
+              context.serverState().getSubscriptionId(), TimestampsToReturn.Both, itemsToCreate);
+
+      MonitoredItemCreateResult[] results = response.getResults();
+      if (results == null || results.length != partition.size()) {
+        throw unexpectedResultCount(
+            "CreateMonitoredItems", results == null ? null : results.length, partition.size());
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(results.length);
+
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, partition.size());
+        }
+
+        for (int i = 0; i < results.length; i++) {
+          MonitoredItemCreateResult result = results[i];
+          OpcUaMonitoredItem monitoredItem = partition.get(i);
+
+          monitoredItem.applyCreateResult(result);
+
+          serviceOperationResults.add(
+              new MonitoredItemServiceOperationResult(
+                  monitoredItem, StatusCode.GOOD, result.getStatusCode()));
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(serviceOperationResults, null, partition.size());
+    } catch (UaException e) {
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, partition.size());
+        }
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      for (OpcUaMonitoredItem item : partition) {
+        serviceOperationResults.add(
+            new MonitoredItemServiceOperationResult(item, e.getStatusCode(), null));
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, e.getStatusCode(), partition.size());
+    }
+  }
+
+  /**
+   * Modify any MonitoredItems that have been changed.
+   *
+   * @return a List of the MonitoredItems that were modified.
+   */
+  public List<MonitoredItemServiceOperationResult> modifyMonitoredItems() {
+    List<OpcUaMonitoredItem> itemsToModify =
+        monitoredItems.values().stream()
+            .filter(item -> item.getSyncState() == OpcUaMonitoredItem.SyncState.UNSYNCHRONIZED)
+            .collect(Collectors.toList());
+
+    if (!itemsToModify.isEmpty()) {
+      return modifyMonitoredItems(itemsToModify);
+    } else {
+      return Collections.emptyList();
+    }
+  }
+
+  private List<MonitoredItemServiceOperationResult> modifyMonitoredItems(
+      List<OpcUaMonitoredItem> itemsToModify) {
+
+    MonitoredItemOperationContext context = getMonitoredItemOperationContext();
+    if (context == null) {
+      var serviceOperationsResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(itemsToModify.size());
+      for (OpcUaMonitoredItem item : itemsToModify) {
+        serviceOperationsResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+
+      return serviceOperationsResults;
+    }
+
+    return executeMonitoredItemPartitions(
+        itemsToModify, context, partition -> modifyMonitoredItems(context, partition));
+  }
+
+  private MonitoredItemPartitionAttempt modifyMonitoredItems(
+      MonitoredItemOperationContext context, List<OpcUaMonitoredItem> partition) {
+
+    List<MonitoredItemModifyRequest> itemsToModify;
+    synchronized (lifecycleLock) {
+      if (incarnation != context.incarnation()) {
+        return invalidStateAttempt(partition, partition.size());
+      }
+
+      itemsToModify =
+          partition.stream().map(OpcUaMonitoredItem::newModifyRequest).collect(Collectors.toList());
+    }
+
+    try {
+      logger.debug(
+          "id={}, modifyMonitoredItems partition.size(): {}",
+          context.serverState().subscriptionId,
+          partition.size());
+
+      ModifyMonitoredItemsResponse response =
+          client.modifyMonitoredItems(
+              context.serverState().getSubscriptionId(), TimestampsToReturn.Both, itemsToModify);
+
+      MonitoredItemModifyResult[] results = response.getResults();
+      if (results == null || results.length != partition.size()) {
+        throw unexpectedResultCount(
+            "ModifyMonitoredItems", results == null ? null : results.length, partition.size());
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(results.length);
+
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, partition.size());
+        }
+
+        for (int i = 0; i < results.length; i++) {
+          MonitoredItemModifyResult result = results[i];
+          OpcUaMonitoredItem monitoredItem = partition.get(i);
+
+          monitoredItem.applyModifyResult(result);
+
+          serviceOperationResults.add(
+              new MonitoredItemServiceOperationResult(
+                  monitoredItem, StatusCode.GOOD, result.getStatusCode()));
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(serviceOperationResults, null, partition.size());
+    } catch (UaException e) {
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, partition.size());
+        }
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      for (OpcUaMonitoredItem item : partition) {
+        serviceOperationResults.add(
+            new MonitoredItemServiceOperationResult(item, e.getStatusCode(), null));
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, e.getStatusCode(), partition.size());
+    }
+  }
+
+  /**
+   * Delete any MonitoredItems that have been removed from the Subscription.
+   *
+   * <p>A MonitoredItem is only removed from the pending deletion queue once the Server has reported
+   * an operation-level result for it. A deletion that never reached the Server, e.g. because the
+   * service call failed, remains pending and is attempted again by the next call.
+   *
+   * @return a List of the MonitoredItems that were deleted.
+   */
+  public List<MonitoredItemServiceOperationResult> deleteMonitoredItems() {
+    List<OpcUaMonitoredItem> itemsToDelete;
+
+    synchronized (monitoredItemsLock) {
+      // Items that were never created on the Server don't need to be deleted from it.
+      this.itemsToDelete.removeIf(
+          item -> {
+            if (item.getSyncState() == OpcUaMonitoredItem.SyncState.INITIAL) {
+              item.setClientHandle(null);
+              return true;
+            }
+
+            return false;
+          });
+
+      itemsToDelete = List.copyOf(this.itemsToDelete);
+    }
+
+    if (itemsToDelete.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    return deleteMonitoredItems(itemsToDelete);
+  }
+
+  private List<MonitoredItemServiceOperationResult> deleteMonitoredItems(
+      List<OpcUaMonitoredItem> itemsToDelete) {
+
+    MonitoredItemOperationContext context = getMonitoredItemOperationContext();
+    if (context == null) {
+      var serviceOperationsResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(itemsToDelete.size());
+      for (OpcUaMonitoredItem item : itemsToDelete) {
+        serviceOperationsResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+
+      return serviceOperationsResults;
+    }
+
+    return executeMonitoredItemPartitions(
+        itemsToDelete, context, partition -> deleteMonitoredItems(context, partition));
+  }
+
+  private MonitoredItemPartitionAttempt deleteMonitoredItems(
+      MonitoredItemOperationContext context, List<OpcUaMonitoredItem> partition) {
+
+    // Server state may be cleared concurrently, so read each item id only once.
+    var monitoredItemIds = new ArrayList<UInteger>(partition.size());
+    var itemIds = new ArrayList<Optional<UInteger>>(partition.size());
+    var clientHandles = new ArrayList<Optional<UInteger>>(partition.size());
+
+    synchronized (lifecycleLock) {
+      if (incarnation != context.incarnation()) {
+        return invalidStateAttempt(partition, 0);
+      }
+
+      synchronized (monitoredItemsLock) {
+        for (OpcUaMonitoredItem item : partition) {
+          Optional<UInteger> itemId = item.getMonitoredItemId();
+
+          itemIds.add(itemId);
+          clientHandles.add(item.getClientHandle());
+          itemId.ifPresent(monitoredItemIds::add);
+        }
+      }
+    }
+
+    if (monitoredItemIds.isEmpty()) {
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      for (OpcUaMonitoredItem item : partition) {
+        serviceOperationResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+
+      return new MonitoredItemPartitionAttempt(serviceOperationResults, null, 0);
+    }
+
+    try {
+      logger.debug(
+          "id={}, deleteMonitoredItems partition.size(): {}",
+          context.serverState().subscriptionId,
+          partition.size());
+
+      DeleteMonitoredItemsResponse response =
+          client.deleteMonitoredItems(context.serverState().getSubscriptionId(), monitoredItemIds);
+
+      StatusCode[] results = response.getResults();
+      if (results == null || results.length != monitoredItemIds.size()) {
+        throw unexpectedResultCount(
+            "DeleteMonitoredItems",
+            results == null ? null : results.length,
+            monitoredItemIds.size());
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, monitoredItemIds.size());
+        }
+
+        int resultIndex = 0;
+        for (int i = 0; i < partition.size(); i++) {
+          OpcUaMonitoredItem item = partition.get(i);
+
+          if (itemIds.get(i).isPresent()) {
+            StatusCode result = results[resultIndex++];
+
+            applyMonitoredItemDeleteResult(item, clientHandles.get(i), result);
+
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(item, StatusCode.GOOD, result));
+          } else {
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(
+                    item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+          }
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, null, monitoredItemIds.size());
+    } catch (UaException e) {
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, monitoredItemIds.size());
+        }
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      for (int i = 0; i < partition.size(); i++) {
+        OpcUaMonitoredItem item = partition.get(i);
+
+        if (itemIds.get(i).isPresent()) {
+          serviceOperationResults.add(
+              new MonitoredItemServiceOperationResult(item, e.getStatusCode(), null));
+        } else {
+          serviceOperationResults.add(
+              new MonitoredItemServiceOperationResult(
+                  item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, e.getStatusCode(), monitoredItemIds.size());
+    }
+  }
+
+  /**
+   * Apply an operation-level DeleteMonitoredItems result without corrupting an item that was added
+   * back while the service call was in flight.
+   *
+   * <p>The Server has acted on the deletion, so the item's server state must be cleared either way.
+   * If the application added the item back, it remains in {@link #monitoredItems}; restore the
+   * ClientHandle captured for the request after {@link OpcUaMonitoredItem#applyDeleteResult} clears
+   * it, so a later {@link #createMonitoredItems()} can recreate the desired item. If it was not
+   * added back, it stays detached as before.
+   */
+  private void applyMonitoredItemDeleteResult(
+      OpcUaMonitoredItem item, Optional<UInteger> clientHandle, StatusCode result) {
+
+    synchronized (monitoredItemsLock) {
+      boolean readded =
+          clientHandle.map(handle -> monitoredItems.get(handle) == item).orElse(false);
+
+      item.applyDeleteResult(result);
+
+      if (readded) {
+        UInteger handle = clientHandle.orElseThrow();
+        item.setClientHandle(handle);
+      }
+
+      // An operation-level result means the Server acted on the deletion, either by deleting the
+      // item or by reporting that it was already gone. Remove the original pending deletion in the
+      // same critical section as applying the result, so a later remove is a distinct operation
+      // that this response cannot consume.
+      itemsToDelete.remove(item);
+    }
+  }
+
+  private List<MonitoredItemServiceOperationResult> executeMonitoredItemPartitions(
+      List<OpcUaMonitoredItem> items,
+      MonitoredItemOperationContext context,
+      Function<List<OpcUaMonitoredItem>, MonitoredItemPartitionAttempt> operation) {
+
+    var serviceOperationResults = new ArrayList<MonitoredItemServiceOperationResult>(items.size());
+
+    long partitionGeneration = monitoredItemPartitionGeneration;
+    int partitionSize = getMonitoredItemPartitionSize().intValue();
+    if (partitionSize == 0) {
+      throw new IllegalArgumentException("maxMonitoredItemsPerCall must be greater than zero");
+    }
+
+    int partitionStart = 0;
+
+    while (partitionStart < items.size()) {
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          serviceOperationResults.addAll(
+              invalidStateAttempt(items.subList(partitionStart, items.size()), 0).results());
+          break;
+        }
+      }
+
+      int remaining = items.size() - partitionStart;
+      int partitionEnd = partitionStart + Math.min(partitionSize, remaining);
+      List<OpcUaMonitoredItem> partition = items.subList(partitionStart, partitionEnd);
+
+      MonitoredItemPartitionAttempt attempt = operation.apply(partition);
+
+      if (attempt.operationCount() > 1
+          && attempt.serviceResult() != null
+          && attempt.serviceResult().value() == StatusCodes.Bad_TooManyOperations) {
+
+        synchronized (lifecycleLock) {
+          if (incarnation != context.incarnation()) {
+            serviceOperationResults.addAll(
+                invalidStateAttempt(items.subList(partitionStart, items.size()), 0).results());
+            break;
+          }
+
+          synchronized (monitoredItemPartitionSize) {
+            if (monitoredItemPartitionGeneration == partitionGeneration) {
+              monitoredItemPartitionSize.set(uint(1));
+            }
+          }
+        }
+
+        partitionSize = 1;
+      } else {
+        serviceOperationResults.addAll(attempt.results());
+        partitionStart = partitionEnd;
+      }
+    }
+
+    return serviceOperationResults;
+  }
+
+  private @Nullable MonitoredItemOperationContext getMonitoredItemOperationContext() {
+    synchronized (lifecycleLock) {
+      ServerState serverState = this.serverState;
+      return serverState != null
+          ? new MonitoredItemOperationContext(serverState, incarnation)
+          : null;
+    }
+  }
+
+  private static MonitoredItemPartitionAttempt invalidStateAttempt(
+      List<OpcUaMonitoredItem> items, int operationCount) {
+
+    var results = new ArrayList<MonitoredItemServiceOperationResult>(items.size());
+    StatusCode statusCode = new StatusCode(StatusCodes.Bad_InvalidState);
+
+    for (OpcUaMonitoredItem item : items) {
+      results.add(new MonitoredItemServiceOperationResult(item, statusCode, null));
+    }
+
+    return new MonitoredItemPartitionAttempt(results, statusCode, operationCount);
+  }
+
+  private static UaException unexpectedResultCount(
+      String serviceName, @Nullable Integer actual, int expected) {
+
+    return new UaException(
+        StatusCodes.Bad_UnexpectedError,
+        "%s returned %s results, expected %s"
+            .formatted(serviceName, actual == null ? "null" : actual, expected));
+  }
+
+  private UInteger getMonitoredItemPartitionSize() {
+    return monitoredItemPartitionSize.get(
+        () -> {
+          UInteger serverMaxMonitoredItemsPerCall;
+          try {
+            serverMaxMonitoredItemsPerCall =
+                client.getOperationLimits().maxMonitoredItemsPerCall().orElse(UInteger.MAX);
+
+            if (serverMaxMonitoredItemsPerCall.intValue() == 0) {
+              serverMaxMonitoredItemsPerCall = UInteger.MAX;
+            }
+          } catch (UaException e) {
+            serverMaxMonitoredItemsPerCall = UInteger.MAX;
+          }
+
+          int configuredMax = Ints.saturatedCast(maxMonitoredItemsPerCall.longValue());
+          int serverMax = Ints.saturatedCast(serverMaxMonitoredItemsPerCall.longValue());
+
+          return uint(Math.min(configuredMax, serverMax));
+        });
+  }
+
+  private record MonitoredItemPartitionAttempt(
+      List<MonitoredItemServiceOperationResult> results,
+      @Nullable StatusCode serviceResult,
+      int operationCount) {}
+
+  private record MonitoredItemOperationContext(ServerState serverState, long incarnation) {}
+
+  // endregion
+
+  // region MonitoringMode Management
+
+  /**
+   * Set the {@link MonitoringMode} for a group of MonitoredItems.
+   *
+   * <p>A MonitoredItem that does not exist on the Server produces a {@code Bad_InvalidState}
+   * service result.
+   *
+   * @param monitoringMode the MonitoringMode to set.
+   * @param monitoredItems the MonitoredItems to set the MonitoringMode for.
+   * @return a List of {@link MonitoredItemServiceOperationResult}s that contain the MonitoredItem
+   *     and the service- and operation-level results associated with the attempt to set the
+   *     MonitoringMode.
+   */
+  public List<MonitoredItemServiceOperationResult> setMonitoringMode(
+      MonitoringMode monitoringMode, List<OpcUaMonitoredItem> monitoredItems) {
+
+    if (monitoredItems.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    MonitoredItemOperationContext context = getMonitoredItemOperationContext();
+    if (context == null) {
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(monitoredItems.size());
+      for (OpcUaMonitoredItem item : monitoredItems) {
+        serviceOperationResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+      return serviceOperationResults;
+    }
+
+    return executeMonitoredItemPartitions(
+        monitoredItems,
+        context,
+        partition -> setMonitoringMode(context, monitoringMode, partition));
+  }
+
+  private MonitoredItemPartitionAttempt setMonitoringMode(
+      MonitoredItemOperationContext context,
+      MonitoringMode monitoringMode,
+      List<OpcUaMonitoredItem> partition) {
+
+    // Server state may be cleared concurrently, so read each item id only once.
+    var monitoredItemIds = new ArrayList<UInteger>(partition.size());
+    var itemIds = new ArrayList<Optional<UInteger>>(partition.size());
+
+    synchronized (lifecycleLock) {
+      if (incarnation != context.incarnation()) {
+        return invalidStateAttempt(partition, 0);
+      }
+
+      for (OpcUaMonitoredItem item : partition) {
+        Optional<UInteger> itemId = item.getMonitoredItemId();
+
+        itemIds.add(itemId);
+        itemId.ifPresent(monitoredItemIds::add);
+      }
+    }
+
+    if (monitoredItemIds.isEmpty()) {
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      for (OpcUaMonitoredItem item : partition) {
+        serviceOperationResults.add(
+            new MonitoredItemServiceOperationResult(
+                item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+      }
+
+      return new MonitoredItemPartitionAttempt(serviceOperationResults, null, 0);
+    }
+
+    try {
+      logger.debug(
+          "id={}, setMonitoringMode partition.size(): {}",
+          context.serverState().subscriptionId,
+          partition.size());
+
+      SetMonitoringModeResponse response =
+          client.setMonitoringMode(
+              context.serverState().getSubscriptionId(), monitoringMode, monitoredItemIds);
+
+      StatusCode[] results = response.getResults();
+      if (results == null || results.length != monitoredItemIds.size()) {
+        throw unexpectedResultCount(
+            "SetMonitoringMode", results == null ? null : results.length, monitoredItemIds.size());
+      }
+
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, monitoredItemIds.size());
+        }
+
+        int resultIndex = 0;
+        for (int i = 0; i < partition.size(); i++) {
+          OpcUaMonitoredItem item = partition.get(i);
+
+          if (itemIds.get(i).isPresent()) {
+            StatusCode result = results[resultIndex++];
+
+            item.applySetMonitoringModeResult(result);
+            if (result.isGood()) {
+              item.setMonitoringMode(monitoringMode);
+            }
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(item, StatusCode.GOOD, result));
+          } else {
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(
+                    item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+          }
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, null, monitoredItemIds.size());
+    } catch (UaException e) {
+      var serviceOperationResults =
+          new ArrayList<MonitoredItemServiceOperationResult>(partition.size());
+
+      synchronized (lifecycleLock) {
+        if (incarnation != context.incarnation()) {
+          return invalidStateAttempt(partition, monitoredItemIds.size());
+        }
+
+        for (int i = 0; i < partition.size(); i++) {
+          OpcUaMonitoredItem item = partition.get(i);
+
+          if (itemIds.get(i).isPresent()) {
+            if (monitoredItemIds.size() == 1
+                || e.getStatusCode().value() != StatusCodes.Bad_TooManyOperations) {
+              item.applySetMonitoringModeResult(e.getStatusCode());
+            }
+
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(item, e.getStatusCode(), null));
+          } else {
+            serviceOperationResults.add(
+                new MonitoredItemServiceOperationResult(
+                    item, new StatusCode(StatusCodes.Bad_InvalidState), null));
+          }
+        }
+      }
+
+      return new MonitoredItemPartitionAttempt(
+          serviceOperationResults, e.getStatusCode(), monitoredItemIds.size());
+    }
+  }
+
+  // endregion
+
+  // region Publishing Management
+
+  /**
+   * Set the publishing mode, i.e. enable or disable publishing, for this Subscription.
+   *
+   * <p>Serialized against the other lifecycle transitions; see the class documentation. A {@link
+   * #reset()} made while this call is waiting for the Server supersedes it: the new publishing mode
+   * belongs to a Subscription this object no longer represents, so it is discarded and the call
+   * fails with {@code Bad_InvalidState}.
+   *
+   * <p>Blocks until the Server has answered; this is {@link #setPublishingModeAsync(boolean)}
+   * awaited, so it must not be called from a transport executor thread. See the class
+   * documentation.
+   *
+   * @param enabled {@code true} to enable publishing, {@code false} to disable publishing.
+   * @throws UaException if a service- or operation-level error occurs.
+   */
+  public void setPublishingMode(boolean enabled) throws UaException {
+    await(setPublishingModeAsync(enabled));
+  }
+
+  /**
+   * Set the publishing mode, i.e. enable or disable publishing, for this Subscription.
+   *
+   * @param enabled {@code true} to enable publishing, {@code false} to disable publishing.
+   * @return a {@link CompletionStage} that completes successfully if the operation was successful,
+   *     or completes exceptionally if there was a service- or operation-level error.
+   */
+  public CompletionStage<Unit> setPublishingModeAsync(boolean enabled) {
+    return runTransition(() -> setPublishingModeTransition(enabled));
+  }
+
+  /**
+   * Call the SetPublishingMode service and record the publishing mode the Server accepted.
+   *
+   * <p>Runs with the transition slot claimed; see {@link #runTransition(Supplier)}.
+   *
+   * @param enabled {@code true} to enable publishing, {@code false} to disable publishing.
+   * @return a {@link CompletionStage} that completes when the publishing mode has been set, or
+   *     completes exceptionally if it has not been.
+   */
+  private CompletionStage<Unit> setPublishingModeTransition(boolean enabled) {
+    long incarnation;
+    ServerState serverState;
+
+    synchronized (lifecycleLock) {
+      if (syncState == SyncState.INITIAL) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      }
+
+      serverState = this.serverState;
+      if (serverState == null) {
+        return CompletableFuture.failedFuture(new UaException(StatusCodes.Bad_InvalidState));
+      }
+
+      incarnation = this.incarnation;
+    }
+
+    ServerState previousState = serverState;
+
+    return client
+        .setPublishingModeAsync(enabled, List.of(serverState.getSubscriptionId()))
+        .thenCompose(
+            response ->
+                applySetPublishingModeResponse(response, previousState, enabled, incarnation));
+  }
+
+  /**
+   * Record the publishing mode the Server accepted, unless a {@link #reset()} has meanwhile
+   * discarded the Subscription it belongs to.
+   *
+   * @param response the {@link SetPublishingModeResponse} the Server returned.
+   * @param previousState the {@link ServerState} the call was made against.
+   * @param enabled the publishing mode the call requested.
+   * @param incarnation the {@link #incarnation} the call was made for.
+   * @return a {@link CompletionStage} that completes when the response has been dealt with, or
+   *     completes exceptionally with {@code Bad_InvalidState} if the Subscription it describes has
+   *     been superseded, or with the operation-level result if it was not Good.
+   */
+  private CompletionStage<Unit> applySetPublishingModeResponse(
+      SetPublishingModeResponse response,
+      ServerState previousState,
+      boolean enabled,
+      long incarnation) {
+
+    StatusCode result = requireNonNull(response.getResults())[0];
+
+    synchronized (lifecycleLock) {
+      if (this.incarnation != incarnation) {
+        return CompletableFuture.failedFuture(
+            new UaException(
+                StatusCodes.Bad_InvalidState,
+                "the Subscription was reset while its publishing mode was being set"));
+      }
+
+      if (!result.isGood()) {
+        return CompletableFuture.failedFuture(new UaException(result));
+      }
+
+      this.serverState =
+          new ServerState(
+              previousState.getSubscriptionId(),
+              previousState.getPublishingInterval(),
+              previousState.getLifetimeCount(),
+              previousState.getMaxKeepAliveCount(),
+              maxNotificationsPerPublish,
+              priority,
+              enabled);
+
+      return CompletableFuture.completedFuture(Unit.VALUE);
+    }
+  }
+
+  // endregion
+
+  /**
+   * Get the current {@link SyncState} of this Subscription.
+   *
+   * <p>A lifecycle transition waiting for the Server is not visible here: the state does not
+   * advance until the Server has answered, so a Subscription being created still reports {@link
+   * SyncState#INITIAL}, and one being modified still reports {@link SyncState#UNSYNCHRONIZED}. That
+   * is what remains true of the Subscription while the request is in flight — and it is also why a
+   * transition can fail without the state having to be rolled back.
+   *
+   * @return the current {@link SyncState} of this Subscription.
+   */
+  public SyncState getSyncState() {
+    return syncState;
+  }
+
+  /**
+   * Check if all {@link OpcUaMonitoredItem}s belonging to this subscription are synchronized with
+   * the server.
+   *
+   * <p>Returns {@code true} when no MonitoredItems that require server-side deletion are pending
+   * deletion and every item in the subscription has {@link
+   * OpcUaMonitoredItem.SyncState#SYNCHRONIZED}. Items pending deletion while still in {@link
+   * OpcUaMonitoredItem.SyncState#INITIAL} are ignored because they were never created on the
+   * server.
+   *
+   * @return {@code true} if all MonitoredItems are synchronized.
+   */
+  public boolean isMonitoredItemsSynchronized() {
+    return itemsToDelete.stream()
+            .noneMatch(item -> item.getSyncState() != OpcUaMonitoredItem.SyncState.INITIAL)
+        && monitoredItems.values().stream()
+            .allMatch(item -> item.getSyncState() == OpcUaMonitoredItem.SyncState.SYNCHRONIZED);
+  }
+
+  /**
+   * Check if this subscription and all its {@link OpcUaMonitoredItem}s are synchronized with the
+   * server.
+   *
+   * <p>Equivalent to checking that {@link #getSyncState()} is {@link SyncState#SYNCHRONIZED} and
+   * {@link #isMonitoredItemsSynchronized()} is {@code true}.
+   *
+   * @return {@code true} if the subscription settings and all MonitoredItems are synchronized.
+   */
+  public boolean isFullySynchronized() {
+    return syncState == SyncState.SYNCHRONIZED && isMonitoredItemsSynchronized();
+  }
+
+  /**
+   * @return the current {@link ServerState} of this Subscription, if it has been created.
+   */
+  public Optional<ServerState> getServerState() {
+    return Optional.ofNullable(serverState);
+  }
+
+  /**
+   * Get a list of the MonitoredItems belonging to this Subscription.
+   *
+   * <p>If {@link #synchronizeMonitoredItems()} has not been called since adding or removing
+   * MonitoredItems, this List may not represent the server's view of the MonitoredItems.
+   *
+   * @return a List of the MonitoredItems belonging to this Subscription.
+   */
+  public List<OpcUaMonitoredItem> getMonitoredItems() {
+    return List.copyOf(monitoredItems.values());
+  }
+
+  /**
+   * Get the current PublishingInterval for this Subscription.
+   *
+   * <p>The server may have revised it upon creation or modification.
+   *
+   * @return the current PublishingInterval for this Subscription.
+   * @see #getRevisedPublishingInterval()
+   */
+  public Double getPublishingInterval() {
+    return publishingInterval;
+  }
+
+  /**
+   * Get the current LifetimeCount for this Subscription.
+   *
+   * <p>The server may have revised it upon creation or modification.
+   *
+   * @return the current LifetimeCount for this Subscription.
+   * @see #getRevisedLifetimeCount()
+   */
+  public UInteger getLifetimeCount() {
+    return lifetimeCount;
+  }
+
+  /**
+   * Get the current MaxKeepAliveCount for this Subscription.
+   *
+   * <p>The server may have revised it upon creation or modification.
+   *
+   * @return the current MaxKeepAliveCount for this Subscription.
+   * @see #getRevisedMaxKeepAliveCount()
+   */
+  public UInteger getMaxKeepAliveCount() {
+    return maxKeepAliveCount;
+  }
+
+  /**
+   * Get the Subscription's Priority setting.
+   *
+   * <p>The Server does not revise this setting, so the value reflects the most recently requested
+   * by a create or modify operation.
+   *
+   * @return the Subscription's Priority setting.
+   */
+  public UByte getPriority() {
+    return priority;
+  }
+
+  /**
+   * Get the Subscription's MaxNotificationsPerPublish setting.
+   *
+   * <p>The Server does not revise this setting, so the value reflects the most recently requested
+   * by a create or modify operation.
+   *
+   * @return the Subscription's MaxNotificationsPerPublish setting.
+   */
+  public UInteger getMaxNotificationsPerPublish() {
+    return maxNotificationsPerPublish;
+  }
+
+  /**
+   * Get whether publishing is enabled for this Subscription.
+   *
+   * <p>This is available only after the Subscription has been created.
+   *
+   * @return {@code true} if publishing is enabled for this Subscription.
+   */
+  public Optional<Boolean> isPublishingEnabled() {
+    return getServerState().map(ServerState::isPublishingEnabled);
+  }
+
+  /**
+   * Get the SubscriptionId assigned to this Subscription by the Server.
+   *
+   * <p>The SubscriptionId is available only after the Subscription has been created.
+   *
+   * @return the SubscriptionId assigned to this Subscription by the Server.
+   */
+  public Optional<UInteger> getSubscriptionId() {
+    return getServerState().map(ServerState::getSubscriptionId);
+  }
+
+  /**
+   * Get the revised PublishingInterval from the most recent create or modify operation.
+   *
+   * <p>The revised PublishingInterval is available only after the Subscription has been created or
+   * modified.
+   *
+   * @return the revised PublishingInterval from the most recent create or modify operation.
+   */
+  public Optional<Double> getRevisedPublishingInterval() {
+    return getServerState().map(ServerState::getPublishingInterval);
+  }
+
+  /**
+   * Get the revised LifetimeCount from the most recent create or modify operation.
+   *
+   * <p>The revised LifetimeCount is available only after the Subscription has been created or
+   * modified.
+   *
+   * @return the revised LifetimeCount from the most recent create or modify operation.
+   */
+  public Optional<UInteger> getRevisedLifetimeCount() {
+    return getServerState().map(ServerState::getLifetimeCount);
+  }
+
+  /**
+   * Get the revised MaxKeepAliveCount from the most recent create or modify operation.
+   *
+   * <p>The revised MaxKeepAliveCount is available only after the Subscription has been created or
+   * modified.
+   *
+   * @return the revised MaxKeepAliveCount from the most recent create or modify operation.
+   */
+  public Optional<UInteger> getRevisedMaxKeepAliveCount() {
+    return getServerState().map(ServerState::getMaxKeepAliveCount);
+  }
+
+  /**
+   * Set a new PublishingInterval for this Subscription.
+   *
+   * <p>If the Subscription has not yet been created, this will be the PublishingInterval used
+   * during the create service call.
+   *
+   * <p>If the Subscription has already been created, this will be the PublishingInterval used
+   * during the next modify service call.
+   *
+   * @param publishingInterval the new PublishingInterval.
+   * @see #create()
+   * @see #createAsync()
+   * @see #modify()
+   * @see #modifyAsync()
+   */
+  public void setPublishingInterval(Double publishingInterval) {
+    synchronized (lifecycleLock) {
+      this.publishingInterval = publishingInterval;
+
+      if (syncState != SyncState.INITIAL) {
+        if (modifications == null) {
+          modifications = new Modifications();
+        }
+
+        modifications.publishingInterval = publishingInterval;
+
+        syncState = SyncState.UNSYNCHRONIZED;
+      }
+
+      if (lifetimeAndKeepAliveCalculated) {
+        UInteger maxKeepAliveCount =
+            calculateMaxKeepAliveCount(publishingInterval, DEFAULT_TARGET_KEEP_ALIVE_INTERVAL);
+        UInteger lifetimeCount = calculateLifetimeCount(maxKeepAliveCount);
+
+        setMaxKeepAliveCount(maxKeepAliveCount);
+        setLifetimeCount(lifetimeCount);
+      }
+    }
+  }
+
+  /**
+   * Set a new LifetimeCount for this Subscription.
+   *
+   * <p>If the Subscription has not yet been created, this will be the LifetimeCount used during the
+   * create service call.
+   *
+   * <p>If the Subscription has already been created, this will be the LifetimeCount used during the
+   * next modify service call.
+   *
+   * @param lifetimeCount the new LifetimeCount.
+   * @see #create()
+   * @see #createAsync()
+   * @see #modify()
+   * @see #modifyAsync()
+   */
+  public void setLifetimeCount(UInteger lifetimeCount) {
+    synchronized (lifecycleLock) {
+      this.lifetimeCount = lifetimeCount;
+
+      if (syncState != SyncState.INITIAL) {
+        if (modifications == null) {
+          modifications = new Modifications();
+        }
+
+        modifications.lifetimeCount = lifetimeCount;
+
+        syncState = SyncState.UNSYNCHRONIZED;
+      }
+    }
+  }
+
+  /**
+   * Set a new MaxKeepAliveCount for this Subscription.
+   *
+   * <p>If the Subscription has not yet been created, this will be the MaxKeepAliveCount used during
+   * the create service call.
+   *
+   * <p>If the Subscription has already been created, this will be the MaxKeepAliveCount used during
+   * the next modify service call.
+   *
+   * @param maxKeepAliveCount the new MaxKeepAliveCount.
+   * @see #create()
+   * @see #createAsync()
+   * @see #modify()
+   * @see #modifyAsync()
+   */
+  public void setMaxKeepAliveCount(UInteger maxKeepAliveCount) {
+    synchronized (lifecycleLock) {
+      this.maxKeepAliveCount = maxKeepAliveCount;
+
+      if (syncState != SyncState.INITIAL) {
+        if (modifications == null) {
+          modifications = new Modifications();
+        }
+
+        modifications.maxKeepAliveCount = maxKeepAliveCount;
+
+        syncState = SyncState.UNSYNCHRONIZED;
+      }
+    }
+  }
+
+  /**
+   * Set a new Priority for this Subscription.
+   *
+   * <p>If the Subscription has not yet been created, this will be the Priority used during the
+   * create service call.
+   *
+   * <p>If the Subscription has already been created, this will be the Priority used during the next
+   * modify service call.
+   *
+   * @param priority the new Priority.
+   * @see #create()
+   * @see #createAsync()
+   * @see #modify()
+   * @see #modifyAsync()
+   */
+  public void setPriority(UByte priority) {
+    synchronized (lifecycleLock) {
+      this.priority = priority;
+
+      if (syncState != SyncState.INITIAL) {
+        if (modifications == null) {
+          modifications = new Modifications();
+        }
+
+        modifications.priority = priority;
+
+        syncState = SyncState.UNSYNCHRONIZED;
+      }
+    }
+  }
+
+  /**
+   * Set a new MaxNotificationsPerPublish for this Subscription.
+   *
+   * <p>If the Subscription has not yet been created, this will be the MaxNotificationsPerPublish
+   * used during the create service call.
+   *
+   * <p>If the Subscription has already been created, this will be the MaxNotificationsPerPublish
+   * used during the next modify service call.
+   *
+   * @param maxNotificationsPerPublish the new MaxNotificationsPerPublish.
+   * @see #create()
+   * @see #createAsync()
+   * @see #modify()
+   * @see #modifyAsync()
+   */
+  public void setMaxNotificationsPerPublish(UInteger maxNotificationsPerPublish) {
+    synchronized (lifecycleLock) {
+      this.maxNotificationsPerPublish = maxNotificationsPerPublish;
+
+      if (syncState != SyncState.INITIAL) {
+        if (modifications == null) {
+          modifications = new Modifications();
+        }
+
+        modifications.maxNotificationsPerPublish = maxNotificationsPerPublish;
+
+        syncState = SyncState.UNSYNCHRONIZED;
+      }
+    }
+  }
+
+  /**
+   * Set whether the LifetimeCount and MaxKeepAliveCount should be calculated automatically any time
+   * the PublishingInterval is set.
+   *
+   * @param lifetimeAndKeepAliveCalculated {@code true} if the LifetimeCount and MaxKeepAliveCount
+   *     should be calculated automatically.
+   * @see #isLifetimeAndKeepAliveCalculated()
+   */
+  public void setLifetimeAndKeepAliveCalculated(boolean lifetimeAndKeepAliveCalculated) {
+    this.lifetimeAndKeepAliveCalculated = lifetimeAndKeepAliveCalculated;
+  }
+
+  /**
+   * @return {@code true} if the LifetimeCount and MaxKeepAliveCount are calculated automatically
+   *     any time the Publishing Interval is set.
+   * @see #setLifetimeAndKeepAliveCalculated(boolean)
+   */
+  public boolean isLifetimeAndKeepAliveCalculated() {
+    return lifetimeAndKeepAliveCalculated;
+  }
+
+  /**
+   * Set the target keep-alive interval, in milliseconds, for this Subscription.
+   *
+   * <p>The Subscription must be configured to automatically calculate the Lifetime and KeepAlive
+   * for this to have any effect. MaxKeepAliveCount and LifetimeCount will be recalculated based on
+   * the target value. The Subscription settings must be synchronized before this change takes
+   * effect.
+   *
+   * @param targetKeepAliveInterval the target keep-alive interval, in milliseconds.
+   * @see #isLifetimeAndKeepAliveCalculated()
+   * @see #setLifetimeAndKeepAliveCalculated(boolean)
+   */
+  public void setTargetKeepAliveInterval(double targetKeepAliveInterval) {
+    if (isLifetimeAndKeepAliveCalculated()) {
+      setMaxKeepAliveCount(calculateMaxKeepAliveCount(publishingInterval, targetKeepAliveInterval));
+      setLifetimeCount(calculateLifetimeCount(maxKeepAliveCount));
+    }
+  }
+
+  /**
+   * Set the maximum number of MonitoredItems that can be created/modified/deleted in a single
+   * service call.
+   *
+   * <p>This value is compared against the value read from the Server's OperationLimits object, and
+   * the smaller of the two is used.
+   *
+   * @param maxMonitoredItemsPerCall the maximum number of MonitoredItems that can be
+   *     created/modified/deleted in a single service call.
+   */
+  public void setMaxMonitoredItemsPerCall(UInteger maxMonitoredItemsPerCall) {
+    synchronized (monitoredItemPartitionSize) {
+      this.maxMonitoredItemsPerCall = maxMonitoredItemsPerCall;
+      monitoredItemPartitionGeneration++;
+
+      // next service call will re-calculate the partition size
+      monitoredItemPartitionSize.reset();
+    }
+  }
+
+  /**
+   * Set the multiplier used to calculate the watchdog timeout. The multiplier is applied to the
+   * keep-alive interval.
+   *
+   * @param watchdogMultiplier the watchdog multiplier.
+   */
+  public void setWatchdogMultiplier(double watchdogMultiplier) {
+    this.watchdogMultiplier = Math.max(1.0, watchdogMultiplier);
+  }
+
+  /**
+   * Set the {@link SubscriptionListener} for this Subscription.
+   *
+   * @param listener the {@link SubscriptionListener} for this Subscription.
+   */
+  public void setSubscriptionListener(@Nullable SubscriptionListener listener) {
+    this.listener = listener;
+  }
+
+  /**
+   * Associate an arbitrary user object with this Subscription.
+   *
+   * @param userObject the user object to associate with this Subscription.
+   */
+  public void setUserObject(@Nullable Object userObject) {
+    this.userObject = userObject;
+  }
+
+  /**
+   * @return the user object associated with this Subscription.
+   */
+  public Optional<Object> getUserObject() {
+    return Optional.ofNullable(userObject);
+  }
+
+  /**
+   * Get the TaskQueue used to deliver notifications for this Subscription.
+   *
+   * @return the TaskQueue used to deliver notifications for this Subscription.
+   */
+  public TaskQueue getDeliveryQueue() {
+    return deliveryQueue;
+  }
+
+  /**
+   * Reset this Subscription.
+   *
+   * <p>Resetting the Subscription removes it from the Client and PublishingManager, cancels the
+   * watchdog timer, and sets the {@link SyncState} back to {@link SyncState#INITIAL}.
+   *
+   * <p>{@link OpcUaMonitoredItem}s that have been added are reset, but the collection is not
+   * cleared. If the Subscription is created again, the call {@link #synchronizeMonitoredItems()} or
+   * {@link #createMonitoredItems()} to create the items on the Server again.
+   *
+   * <p>MonitoredItems that were removed from the Subscription but not yet deleted from the Server
+   * are discarded: they belong to a Subscription that no longer exists, so there is nothing left to
+   * delete.
+   *
+   * <p>This is called automatically when the Subscription is deleted, but can also be called
+   * manually when necessary if it has been determined the Subscription no longer exists on the
+   * Server.
+   *
+   * <p>Never waits for the Server, and never waits for a lifecycle transition that is waiting for
+   * the Server; see the class documentation for why the callers cannot afford it to.
+   *
+   * <p>A reset still never lands in the middle of a {@link #create()}: it either discards the
+   * Subscription that existed before it, or the one that call goes on to create. What it no longer
+   * does is wait for that call to finish first — a {@link #create()} still in flight is superseded,
+   * so it fails with {@code Bad_InvalidState} and the Subscription the Server created for it is
+   * deleted rather than left running with nothing able to name it. A {@link #modify()}, {@link
+   * #delete()} or {@link #setPublishingMode(boolean)} in flight is superseded the same way.
+   */
+  public void reset() {
+    resetInternal();
+  }
+
+  /** Perform the reset without virtual dispatch. */
+  private void resetInternal() {
+    synchronized (lifecycleLock) {
+      // Unconditional, and before anything else: this is the only record a transition already
+      // waiting for the Server has that the Subscription it was called for is gone. A create() in
+      // flight has published no SyncState yet, so the SyncState check below says nothing about it,
+      // but its result must be discarded all the same.
+      incarnation++;
+
+      if (syncState != SyncState.INITIAL) {
+        cancelWatchdogTimer();
+        client.removeSubscription(this);
+        client.getPublishingManager().removeSubscription(this);
+
+        serverState = null;
+        modifications = null;
+
+        monitoredItemPartitionSize.reset();
+        // Keep reset's handle cleanup atomic with add/remove, in the same lock order used
+        // when applying monitored-item service results.
+        synchronized (monitoredItemsLock) {
+          monitoredItems.values().forEach(OpcUaMonitoredItem::reset);
+
+          // MonitoredItemIds are scoped to the Subscription that no longer exists, so the items
+          // pending deletion are already gone and their ids must never be sent again. Detach them
+          // completely, including the ClientHandle, so they can be added to a Subscription again.
+          itemsToDelete.forEach(
+              item -> {
+                item.reset();
+                item.setClientHandle(null);
+              });
+          itemsToDelete.clear();
+        }
+
+        syncState = SyncState.INITIAL;
+      }
+    }
+  }
+
+  /**
+   * Get the incarnation of this object, i.e. which Subscription it currently represents.
+   *
+   * <p>Captured by {@link PublishingManager} when it registers an entry for this object, and
+   * compared again by {@link #resetIfIncarnation(long)}: a change means this object has stopped
+   * representing the Subscription the caller knew it as.
+   *
+   * @return the current {@link #incarnation}.
+   */
+  long getIncarnation() {
+    synchronized (lifecycleLock) {
+      return incarnation;
+    }
+  }
+
+  /**
+   * {@link #reset()} this Subscription, but only if it still represents the incarnation the caller
+   * knew it as.
+   *
+   * <p>This is the teardown for a Bad_Timeout StatusChangeNotification, which is a statement about
+   * the Subscription the message was received on: applied unconditionally, a stale one — delivered
+   * behind application callbacks of arbitrary duration — would tear down a Subscription created
+   * after it was received.
+   *
+   * @param incarnation the {@link #incarnation} the caller is acting on behalf of.
+   */
+  void resetIfIncarnation(long incarnation) {
+    synchronized (lifecycleLock) {
+      if (this.incarnation == incarnation) {
+        reset();
+      }
+    }
+  }
+
+  /**
+   * Permanently cancel the watchdog timer: the pending expiry is cancelled, the {@link
+   * SessionActivityListener} is de-registered, and the timer is discarded.
+   *
+   * <p>This is for teardown of the Subscription itself, e.g. {@link #reset()}. It cannot be undone;
+   * a new timer is only created by {@link #create()}. To suspend the timer while the Session is
+   * unavailable use {@link #pauseWatchdogTimer()} instead.
+   */
+  synchronized void cancelWatchdogTimer() {
+    WatchdogTimer watchdog = this.watchdogTimer;
+    if (watchdog != null) {
+      client.removeSessionActivityListener(watchdog);
+      watchdog.cancel();
+      this.watchdogTimer = null;
+      logger.debug(
+          "id={}, watchdog timer cancelled",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+    }
+  }
+
+  /**
+   * Suspend the watchdog timer: the pending expiry is cancelled, but the timer remains registered
+   * as a {@link SessionActivityListener} and is re-armed when the Session becomes active again.
+   *
+   * <p>This is for temporary Session unavailability, where no PublishResponse can arrive and the
+   * Server's keep-alive obligation is therefore in abeyance, but the Subscription itself may well
+   * survive (e.g. via TransferSubscriptions once the Session is re-activated).
+   */
+  synchronized void pauseWatchdogTimer() {
+    WatchdogTimer watchdog = this.watchdogTimer;
+    if (watchdog != null) {
+      watchdog.pause();
+      logger.debug(
+          "id={}, watchdog timer paused",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+    }
+  }
+
+  synchronized void resetWatchdogTimer() {
+    if (client.getPublishingManager().isPublishingSuspended()) {
+      // The watchdog is fed only by PublishResponses, and none can arrive while Publish traffic
+      // is suspended: arming it now — from a create or modify made mid-recovery, or from the
+      // finish of a recovery a newer activation has superseded — could only have it fire on a
+      // healthy Subscription. The recovery that ends the suspension re-arms it.
+      logger.debug(
+          "id={}, watchdog timer reset deferred pending reconnect recovery",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+      return;
+    }
+
+    WatchdogTimer watchdog = this.watchdogTimer;
+    if (watchdog != null) {
+      watchdog.reset();
+      logger.trace(
+          "id={}, watchdog timer reset",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+    }
+  }
+
+  private static UInteger calculateMaxKeepAliveCount(
+      double publishingInterval, double targetKeepAliveInterval) {
+    // Send a keep-alive every targetKeepAliveInterval milliseconds if the publishing
+    // interval is faster, or every publishing interval otherwise.
+    int count = (int) Math.ceil(targetKeepAliveInterval / Math.max(1, publishingInterval));
+
+    return uint(Math.max(1, count));
+  }
+
+  private static UInteger calculateLifetimeCount(UInteger maxKeepAliveCount) {
+    // Lifetime must be 3x (or greater) the keep-alive count.
+    BigInteger lifetimeCount =
+        maxKeepAliveCount
+            .toBigInteger()
+            .multiply(BigInteger.valueOf(5))
+            .min(BigInteger.valueOf(UInteger.MAX_VALUE));
+
+    return uint(lifetimeCount.longValue());
+  }
+
+  @Override
+  public String toString() {
+    return new StringJoiner(", ", OpcUaSubscription.class.getSimpleName() + "[", "]")
+        .add("subscriptionId=" + getSubscriptionId().orElse(null))
+        .add("syncState=" + syncState)
+        .toString();
+  }
+
+  void notifyDataReceived(MonitoredItemNotification[] notifications) {
+    var items = new ArrayList<OpcUaMonitoredItem>(notifications.length);
+    var values = new ArrayList<DataValue>(notifications.length);
+
+    for (MonitoredItemNotification notification : notifications) {
+      UInteger clientHandle = notification.getClientHandle();
+      OpcUaMonitoredItem item = monitoredItems.get(clientHandle);
+      if (item != null) {
+        items.add(item);
+        values.add(notification.getValue());
+      } else {
+        // This can happen if an item is deleted while a notification is in-flight.
+        logger.debug(
+            "id={}, received data for unknown ClientHandle: {}",
+            getServerState().map(ServerState::getSubscriptionId).orElse(null),
+            clientHandle);
+      }
+    }
+
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      // Unmodifiable views: the Lists below are the ones the fan-out iterates.
+      List<OpcUaMonitoredItem> itemsView = Collections.unmodifiableList(items);
+      List<DataValue> valuesView = Collections.unmodifiableList(values);
+
+      deliverToListener(
+          "onDataReceived", () -> listener.onDataReceived(this, itemsView, valuesView));
+    }
+
+    for (int i = 0; i < items.size(); i++) {
+      OpcUaMonitoredItem item = items.get(i);
+      DataValue value = values.get(i);
+      deliverToListener("DataValueListener", () -> item.notifyDataValueReceived(value));
+    }
+  }
+
+  void notifyEventsReceived(EventFieldList[] events) {
+    var items = new ArrayList<OpcUaMonitoredItem>(events.length);
+    var eventValuesList = new ArrayList<Variant[]>(events.length);
+
+    for (EventFieldList event : events) {
+      UInteger clientHandle = event.getClientHandle();
+      OpcUaMonitoredItem item = monitoredItems.get(clientHandle);
+      if (item != null) {
+        items.add(item);
+        eventValuesList.add(event.getEventFields());
+      } else {
+        // This can happen if an item is deleted while a notification is in-flight.
+        logger.debug(
+            "id={}, received event for unknown ClientHandle: {}",
+            getServerState().map(ServerState::getSubscriptionId).orElse(null),
+            clientHandle);
+      }
+    }
+
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      // Unmodifiable views: the Lists below are the ones the fan-out iterates.
+      List<OpcUaMonitoredItem> itemsView = Collections.unmodifiableList(items);
+      List<Variant[]> fieldsView = Collections.unmodifiableList(eventValuesList);
+
+      deliverToListener(
+          "onEventReceived", () -> listener.onEventReceived(this, itemsView, fieldsView));
+    }
+
+    for (int i = 0; i < items.size(); i++) {
+      OpcUaMonitoredItem item = items.get(i);
+      Variant[] eventValues = eventValuesList.get(i);
+      deliverToListener("EventValueListener", () -> item.notifyEventValuesReceived(eventValues));
+    }
+  }
+
+  /**
+   * Called from {@link PublishingManager} while already executing on {@link #deliveryQueue}, so the
+   * listener is invoked inline to keep it ordered with the data and event callbacks and inside the
+   * delivery task the backpressure mechanism waits on.
+   */
+  void notifyKeepAliveReceived() {
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      deliverToListener("onKeepAliveReceived", () -> listener.onKeepAliveReceived(this));
+    }
+  }
+
+  /**
+   * Called from {@link PublishingManager} while already executing on {@link #deliveryQueue}, so the
+   * listener is invoked inline to keep it ordered with the data and event callbacks and inside the
+   * delivery task the backpressure mechanism waits on.
+   *
+   * <p>The teardown a Bad_Timeout implies is not done here: the caller applies it via {@link
+   * #resetIfIncarnation(long)}, guarded by the identity of the Subscription the notification was
+   * received on, which this object no longer knows.
+   */
+  void notifyStatusChanged(StatusCode status) {
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      deliverToListener("onStatusChanged", () -> listener.onStatusChanged(this, status));
+    }
+  }
+
+  /**
+   * Unlike the notification callbacks above, this is called from <i>off</i> the {@link
+   * #deliveryQueue} and must therefore be enqueued onto it.
+   */
+  void notifyNotificationDataLost() {
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      deliveryQueue.execute(() -> listener.onNotificationDataLost(this));
+    }
+  }
+
+  /**
+   * Reset this Subscription and enqueue its transfer-failure listener notification.
+   *
+   * <p>Session transfer uses {@link #handleTransferFailure(StatusCode)} so the reset cannot be
+   * delayed by an override of this method. A direct call retains the established public behavior:
+   * it resets first, then queues the listener callback onto the {@link #deliveryQueue}.
+   */
+  public void notifyTransferFailed(StatusCode status) {
+    if (!Boolean.TRUE.equals(transferFailureAlreadyHandled.get())) {
+      reset();
+    }
+
+    SubscriptionListener listener = this.listener;
+    if (listener != null) {
+      deliveryQueue.execute(() -> listener.onTransferFailed(this, status));
+    }
+  }
+
+  /**
+   * Reset this Subscription before the Session FSM can become Active, then dispatch the public,
+   * overridable transfer-failure notification away from the FSM completion path.
+   *
+   * <p>This method is final because transfer cleanup is an internal ordering invariant: a subclass
+   * that blocks or throws from {@link #notifyTransferFailed(StatusCode)} must not keep the Session
+   * in its Transferring state or let reconnect recovery observe a Subscription that was not
+   * transferred.
+   *
+   * @param status the operation- or service-level transfer failure.
+   */
+  public final void handleTransferFailure(StatusCode status) {
+    resetInternal();
+
+    try {
+      client
+          .getTransport()
+          .getConfig()
+          .getExecutor()
+          .execute(
+              () -> {
+                transferFailureAlreadyHandled.set(Boolean.TRUE);
+
+                try {
+                  notifyTransferFailed(status);
+                } catch (Exception e) {
+                  logger.warn("notifyTransferFailed threw an unhandled Exception", e);
+                } finally {
+                  transferFailureAlreadyHandled.remove();
+                }
+              });
+    } catch (Exception e) {
+      // Cleanup is complete. A rejected application notification must not fail Session transfer or
+      // leave the FSM waiting forever for work its executor will never accept.
+      logger.warn("could not dispatch notifyTransferFailed", e);
+    }
+  }
+
+  /**
+   * Invoke an application-supplied callback, containing any Exception it throws.
+   *
+   * <p>The {@link SubscriptionListener} and each MonitoredItem's listener are independent sinks for
+   * the same notification: one of them failing must not cost the others their notification, and
+   * must not abort delivery of the remaining NotificationData in the same NotificationMessage.
+   *
+   * @param callback the name of the callback being invoked, for logging.
+   * @param delivery the callback invocation.
+   */
+  private void deliverToListener(String callback, Runnable delivery) {
+    try {
+      delivery.run();
+    } catch (Exception e) {
+      logger.warn(
+          "id={}, {} threw an unhandled Exception",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null),
+          callback,
+          e);
+    }
+  }
+
+  private static class Modifications {
+
+    private volatile @Nullable Double publishingInterval;
+    private volatile @Nullable UInteger lifetimeCount;
+    private volatile @Nullable UInteger maxKeepAliveCount;
+    private volatile @Nullable UInteger maxNotificationsPerPublish;
+    private volatile @Nullable UByte priority;
+
+    private Optional<Double> publishingInterval() {
+      return Optional.ofNullable(publishingInterval);
+    }
+
+    private Optional<UInteger> lifetimeCount() {
+      return Optional.ofNullable(lifetimeCount);
+    }
+
+    private Optional<UInteger> maxKeepAliveCount() {
+      return Optional.ofNullable(maxKeepAliveCount);
+    }
+
+    private Optional<UInteger> maxNotificationsPerPublish() {
+      return Optional.ofNullable(maxNotificationsPerPublish);
+    }
+
+    private Optional<UByte> priority() {
+      return Optional.ofNullable(priority);
+    }
+  }
+
+  private class WatchdogTimer implements SessionActivityListener {
+
+    /**
+     * Guards every transition of this timer. The state below is read and written by unrelated
+     * threads - the transport executor completing a PublishResponse, the Session FSM notifying
+     * activity listeners, and the scheduled executor running an expiry - and each transition spans
+     * a cancel/schedule/store sequence that must be atomic as a whole.
+     */
+    private final Object lock = new Object();
+
+    /** The pending expiry, or {@code null} if the timer is not armed. Guarded by {@link #lock}. */
+    private @Nullable ScheduledFuture<?> scheduledFuture;
+
+    /** Terminal once set: a cancelled timer never arms again. Guarded by {@link #lock}. */
+    private boolean cancelled = false;
+
+    /**
+     * Incremented on every transition, and captured by each expiry when it is scheduled, so that an
+     * expiry which has already begun running - and which {@code ScheduledFuture.cancel(false)}
+     * therefore cannot stop - is recognised as stale and ignored. Guarded by {@link #lock}.
+     */
+    private long epoch = 0L;
+
+    void reset() {
+      synchronized (lock) {
+        if (cancelled) {
+          return;
+        }
+
+        cancelPending();
+        scheduleNext();
+      }
+    }
+
+    /** Cancel the pending expiry, leaving the timer able to arm again. */
+    void pause() {
+      synchronized (lock) {
+        cancelPending();
+      }
+    }
+
+    /** Cancel the pending expiry permanently; subsequent calls to {@link #reset()} are no-ops. */
+    void cancel() {
+      synchronized (lock) {
+        cancelled = true;
+
+        cancelPending();
+      }
+    }
+
+    /** Must be called while holding {@link #lock}. */
+    private void cancelPending() {
+      epoch++;
+
+      ScheduledFuture<?> sf = scheduledFuture;
+      if (sf != null) {
+        sf.cancel(false);
+        scheduledFuture = null;
+      }
+    }
+
+    /** Must be called while holding {@link #lock}. */
+    private void scheduleNext() {
+      getServerState()
+          .ifPresent(
+              state -> {
+                long delay =
+                    Math.round(
+                        (state.publishingInterval * (state.maxKeepAliveCount.longValue() + 1))
+                            * watchdogMultiplier);
+
+                long scheduledEpoch = epoch;
+
+                scheduledFuture =
+                    client
+                        .getTransport()
+                        .getConfig()
+                        .getScheduledExecutor()
+                        .schedule(
+                            () -> notifyWatchdogTimerElapsed(scheduledEpoch, delay),
+                            delay,
+                            TimeUnit.MILLISECONDS);
+
+                logger.debug(
+                    "id={} watchdog timer scheduled for +{}ms", state.subscriptionId, delay);
+              });
+    }
+
+    private void notifyWatchdogTimerElapsed(long scheduledEpoch, long delay) {
+      synchronized (lock) {
+        if (cancelled || scheduledEpoch != epoch) {
+          // This expiry was cancelled or superseded while it was already running.
+          return;
+        }
+
+        scheduledFuture = null;
+      }
+
+      SubscriptionListener listener = OpcUaSubscription.this.listener;
+
+      if (listener != null) {
+        deliveryQueue.execute(
+            () -> {
+              logger.debug(
+                  "id={}, watchdog timer expired after {}ms",
+                  getServerState().map(ServerState::getSubscriptionId).orElse(null),
+                  delay);
+
+              listener.onWatchdogTimerElapsed(OpcUaSubscription.this);
+            });
+      }
+    }
+
+    @Override
+    public void onSessionActive(UaSession session) {
+      // Deliberately not re-armed here: the PublishingManager holds Publish traffic shut until
+      // the Part 4 §6.7 Republish recovery for this activation has finished, so no
+      // PublishResponse — the only event that feeds this timer — can arrive yet. The timer is
+      // re-armed, via resetWatchdogTimer(), when publishing resumes.
+      logger.debug(
+          "id={}, watchdog timer awaiting reconnect recovery after onSessionActive()",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+    }
+
+    @Override
+    public void onSessionInactive(UaSession session) {
+      pause();
+      logger.debug(
+          "id={}, watchdog timer paused via onSessionInactive()",
+          getServerState().map(ServerState::getSubscriptionId).orElse(null));
+    }
+  }
+
+  /**
+   * The state of the Subscription as it exists on the server, after the most recent successful
+   * operation.
+   */
+  public static class ServerState {
+
+    private final UInteger subscriptionId;
+    private final Double publishingInterval;
+    private final UInteger lifetimeCount;
+    private final UInteger maxKeepAliveCount;
+    private final UInteger maxNotificationsPerPublish;
+    private final UByte priority;
+    private final boolean publishingEnabled;
+
+    private ServerState(
+        UInteger subscriptionId,
+        Double publishingInterval,
+        UInteger lifetimeCount,
+        UInteger maxKeepAliveCount,
+        UInteger maxNotificationsPerPublish,
+        UByte priority,
+        boolean publishingEnabled) {
+
+      this.subscriptionId = subscriptionId;
+      this.publishingInterval = publishingInterval;
+      this.lifetimeCount = lifetimeCount;
+      this.maxKeepAliveCount = maxKeepAliveCount;
+      this.maxNotificationsPerPublish = maxNotificationsPerPublish;
+      this.priority = priority;
+      this.publishingEnabled = publishingEnabled;
+    }
+
+    public UInteger getSubscriptionId() {
+      return subscriptionId;
+    }
+
+    public Double getPublishingInterval() {
+      return publishingInterval;
+    }
+
+    public UInteger getLifetimeCount() {
+      return lifetimeCount;
+    }
+
+    public UInteger getMaxKeepAliveCount() {
+      return maxKeepAliveCount;
+    }
+
+    public UInteger getMaxNotificationsPerPublish() {
+      return maxNotificationsPerPublish;
+    }
+
+    public UByte getPriority() {
+      return priority;
+    }
+
+    public boolean isPublishingEnabled() {
+      return publishingEnabled;
+    }
+  }
+
+  public enum SyncState {
+
+    /** The Subscription has been instantiated but does not exist on the server. */
+    INITIAL,
+
+    /**
+     * The Subscription has been created on the server and has no outstanding modifications to
+     * synchronize.
+     */
+    SYNCHRONIZED,
+
+    /**
+     * The Subscription has been created on the server but has outstanding modifications to
+     * synchronize.
+     */
+    UNSYNCHRONIZED
+  }
+
+  public interface SubscriptionListener {
+
+    /**
+     * Called when a Subscription receives a data change notification from the Server.
+     *
+     * <p>Take care not to block unnecessarily in this callback because subscription notifications
+     * are processed synchronously as a backpressure mechanism. Blocking inside this callback will
+     * prevent subsequent notifications from being processed and new PublishRequests from being
+     * sent.
+     *
+     * @param subscription the Subscription that received the data change notification.
+     * @param items the List of MonitoredItems targeted by the data change notification.
+     * @param values the corresponding List of DataValues for the MonitoredItems.
+     */
+    default void onDataReceived(
+        OpcUaSubscription subscription, List<OpcUaMonitoredItem> items, List<DataValue> values) {}
+
+    /**
+     * Called when a Subscription receives an event notification from the Server.
+     *
+     * <p>Take care not to block unnecessarily in this callback because subscription notifications
+     * are processed synchronously as a backpressure mechanism. Blocking inside this callback will
+     * prevent subsequent notifications from being processed and new PublishRequests from being
+     * sent.
+     *
+     * @param subscription the Subscription that received the event notification.
+     * @param items the List of MonitoredItems targeted by the event notification.
+     * @param fields the corresponding List of EventFields for the MonitoredItems.
+     */
+    default void onEventReceived(
+        OpcUaSubscription subscription, List<OpcUaMonitoredItem> items, List<Variant[]> fields) {}
+
+    /**
+     * Called when a Subscription receives a keep-alive notification from the Server.
+     *
+     * <p>Take care not to block unnecessarily in this callback because subscription notifications
+     * are processed synchronously as a backpressure mechanism. Blocking inside this callback will
+     * prevent subsequent notifications from being processed and new PublishRequests from being
+     * sent.
+     *
+     * @param subscription the Subscription that received the keep-alive notification.
+     */
+    default void onKeepAliveReceived(OpcUaSubscription subscription) {}
+
+    /**
+     * Called when attempts to recover missed data notifications have failed, i.e. the Republish
+     * service was called for one or more missing sequence numbers but the Server was unable to
+     * fulfill the requests.
+     *
+     * @param subscription the Subscription that missed data notifications.
+     */
+    default void onNotificationDataLost(OpcUaSubscription subscription) {}
+
+    /**
+     * The Subscription's watchdog timer has elapsed.
+     *
+     * <p>The timer elapses when the configurable multiplier applied to the keep-alive interval has
+     * elapsed without receiving a PublishResponse for this Subscription.
+     *
+     * <p>This is an indication that the Server may be experiencing problems servicing this
+     * Subscription, and the absence of data change notifications no longer implies that values are
+     * not changing. Consider deleting and creating a new Subscription.
+     *
+     * @param subscription the Subscription whose watchdog timer has elapsed.
+     */
+    default void onWatchdogTimerElapsed(OpcUaSubscription subscription) {}
+
+    /**
+     * Called when the status of the Subscription has changed.
+     *
+     * <p>Expected status updates include:
+     *
+     * <ul>
+     *   <li>Bad_Timeout: the Subscription has timed out and no longer exists on the Server.
+     *   <li>Good_Transferred: the Subscription was transferred to another Session.
+     * </ul>
+     *
+     * <p>Take care not to block unnecessarily in this callback because subscription notifications
+     * are processed synchronously as a backpressure mechanism. Blocking inside this callback will
+     * prevent subsequent notifications from being processed and new PublishRequests from being
+     * sent.
+     *
+     * @param subscription the Subscription whose status has changed.
+     * @param status the new status of the Subscription.
+     */
+    default void onStatusChanged(OpcUaSubscription subscription, StatusCode status) {}
+
+    /**
+     * Called when a new Session is established after reconnecting, but transferring this
+     * Subscription to the new Session was unsuccessful.
+     *
+     * @param subscription the Subscription that failed to transfer to the new Session.
+     * @param status the {@link StatusCode} for the transfer failure.
+     */
+    default void onTransferFailed(OpcUaSubscription subscription, StatusCode status) {}
+  }
+}
